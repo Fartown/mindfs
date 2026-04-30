@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +33,7 @@ var errBrowserUnavailable = errors.New("browser auto-open unavailable")
 const (
 	daemonEnvKey          = "MINDFS_DAEMON"
 	internalRestartEnvKey = "MINDFS_INTERNAL_RESTART"
+	staticDirEnvKey       = "MINDFS_STATIC_DIR"
 	maxLogSizeBytes       = 10 * 1024 * 1024
 	maxLogBackups         = 3
 )
@@ -57,11 +59,15 @@ func main() {
 
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
+	e2eeFlag := flag.Bool("e2ee", false, "enable end-to-end encryption for sensitive data")
 	foreground := flag.Bool("foreground", false, "run in the foreground instead of as a background service")
 	stop := flag.Bool("stop", false, "stop the background mindfs service")
 	restart := flag.Bool("restart", false, "restart the background mindfs service")
 	statusFlag := flag.Bool("status", false, "show background service status")
 	remove := flag.Bool("remove", false, "remove the managed directory")
+	tlsFlag := flag.Bool("tls", false, "enable HTTPS (auto-generates self-signed cert if -cert/-key not provided)")
+	certFlag := flag.String("cert", "", "TLS certificate file (PEM); auto-generated if empty with -tls")
+	keyFlag := flag.String("key", "", "TLS private key file (PEM); auto-generated if empty with -tls")
 	flag.Parse()
 	internalRestart := os.Getenv(internalRestartEnvKey) == "1"
 	daemonMode := os.Getenv(daemonEnvKey) == "1"
@@ -90,14 +96,14 @@ func main() {
 	}
 
 	if *statusFlag {
-		if err := printServiceStatus(*addr, pidPath, logPath); err != nil {
+		if err := printServiceStatus(*addr, *tlsFlag, pidPath, logPath); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		return
 	}
 	if *stop {
-		if err := stopService(*addr, pidPath); err != nil {
+		if err := stopService(*addr, *tlsFlag, pidPath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				fmt.Fprintln(os.Stdout, "mindfs service already stopped")
 				return
@@ -109,14 +115,14 @@ func main() {
 		return
 	}
 	if *restart {
-		if err := stopService(*addr, pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := stopService(*addr, *tlsFlag, pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 	}
 
 	if *remove {
-		if err := handleRemoveRoot(*addr, absRoot); err != nil {
+		if err := handleRemoveRoot(*addr, *tlsFlag, absRoot); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
@@ -124,18 +130,38 @@ func main() {
 		return
 	}
 
-	if !internalRestart && !*restart && serverRunning(*addr) {
+	e2eeResult, err := app.EnsureE2EEConfig(*e2eeFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	if *e2eeFlag && strings.TrimSpace(e2eeResult.Config.PairingSecret) != "" {
+		fmt.Fprintln(os.Stdout, "E2EE enabled")
+		fmt.Fprintln(os.Stdout, "pairing secret:", e2eeResult.Config.PairingSecret)
+	}
+
+	if !internalRestart && !*restart && serverRunning(*addr, *tlsFlag) {
 		fmt.Fprintf(os.Stdout, "server already running on %s, reusing existing process\n", *addr)
-		rootInfo, err := addManagedDir(*addr, absRoot)
+		rootInfo, err := addManagedDir(*addr, *tlsFlag, absRoot)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		fmt.Fprintln(os.Stdout, "added managed directory:", rootInfo.RootPath)
-		if err := openTarget(*addr, rootInfo.ID); err != nil {
+		if err := openTarget(*addr, *tlsFlag, rootInfo.ID); err != nil {
 			reportOpenTargetError(os.Stderr, err)
 		}
 		return
+	}
+
+	// Resolve TLS certificate/key paths when TLS is enabled.
+	resolvedCert, resolvedKey := *certFlag, *keyFlag
+	if *tlsFlag && (resolvedCert == "" || resolvedKey == "") {
+		resolvedCert, resolvedKey, err = app.EnsureTLSCert(*certFlag, *keyFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	}
 
 	if !*foreground && !daemonMode && !internalRestart {
@@ -143,18 +169,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		if err := waitForServer(*addr, 8*time.Second); err != nil {
+		if err := waitForServer(*addr, *tlsFlag, 8*time.Second); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		rootInfo, err := addManagedDir(*addr, absRoot)
+		rootInfo, err := addManagedDir(*addr, *tlsFlag, absRoot)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		fmt.Fprintln(os.Stdout, "mindfs service started")
 		fmt.Fprintln(os.Stdout, "added managed directory:", rootInfo.RootPath)
-		if err := openTarget(*addr, rootInfo.ID); err != nil {
+		if err := openTarget(*addr, *tlsFlag, rootInfo.ID); err != nil {
 			reportOpenTargetError(os.Stderr, err)
 		}
 		fmt.Fprintf(os.Stdout, "logs: %s\n", logPath)
@@ -172,17 +198,21 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- app.Start(ctx, *addr, app.StartOptions{
-			NoRelayer: *noRelayer,
-			Version:   version,
-			Args:      os.Args[1:],
+			NoRelayer:  *noRelayer,
+			Version:    version,
+			Args:       os.Args[1:],
+			E2EEConfig: e2eeResult.Config,
+			UseTLS:     *tlsFlag,
+			CertFile:   resolvedCert,
+			KeyFile:    resolvedKey,
 		})
 	}()
-	if err := waitForServer(*addr, 8*time.Second); err != nil {
+	if err := waitForServer(*addr, *tlsFlag, 8*time.Second); err != nil {
 		cancel()
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-	rootInfo, err := addManagedDir(*addr, absRoot)
+	rootInfo, err := addManagedDir(*addr, *tlsFlag, absRoot)
 	if err != nil {
 		cancel()
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -191,7 +221,7 @@ func main() {
 	fmt.Fprintln(os.Stdout, "added managed directory:", rootInfo.RootPath)
 
 	if !internalRestart && (*foreground || !daemonMode) {
-		if err := openTarget(*addr, rootInfo.ID); err != nil {
+		if err := openTarget(*addr, *tlsFlag, rootInfo.ID); err != nil {
 			reportOpenTargetError(os.Stderr, err)
 		}
 	}
@@ -261,6 +291,9 @@ func startBackgroundProcess(logPath string) error {
 	}
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Env = append(cmd.Environ(), daemonEnvKey+"=1")
+	if staticDir := resolveDevelopmentStaticDir(); staticDir != "" {
+		cmd.Env = append(cmd.Env, staticDirEnvKey+"="+staticDir)
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -270,6 +303,25 @@ func startBackgroundProcess(logPath string) error {
 		return err
 	}
 	return logFile.Close()
+}
+
+func resolveDevelopmentStaticDir() string {
+	if len(os.Args) == 0 {
+		return ""
+	}
+	arg0 := strings.TrimSpace(os.Args[0])
+	if arg0 == "" || !strings.HasPrefix(arg0, "."+string(os.PathSeparator)) {
+		return ""
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	candidate := filepath.Join(cwd, "web", "dist")
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return ""
 }
 
 func rotateLogIfNeeded(path string, maxSize int64, backups int) error {
@@ -334,8 +386,8 @@ func readPIDFile(pidPath string) (int, error) {
 	return pid, nil
 }
 
-func stopService(addr, pidPath string) error {
-	pid, err := resolveServicePID(addr, pidPath)
+func stopService(addr string, useTLS bool, pidPath string) error {
+	pid, err := resolveServicePID(addr, useTLS, pidPath)
 	if err != nil {
 		return err
 	}
@@ -360,8 +412,8 @@ func stopService(addr, pidPath string) error {
 	return fmt.Errorf("timed out stopping process %d", pid)
 }
 
-func printServiceStatus(addr, pidPath, logPath string) error {
-	pid, err := resolveServicePID(addr, pidPath)
+func printServiceStatus(addr string, useTLS bool, pidPath, logPath string) error {
+	pid, err := resolveServicePID(addr, useTLS, pidPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintln(os.Stdout, "mindfs status: stopped")
@@ -371,12 +423,12 @@ func printServiceStatus(addr, pidPath, logPath string) error {
 	}
 	fmt.Fprintln(os.Stdout, "mindfs status: running")
 	fmt.Fprintf(os.Stdout, "pid: %d\n", pid)
-	fmt.Fprintf(os.Stdout, "addr: %s\n", addrToURL(addr, ""))
+	fmt.Fprintf(os.Stdout, "addr: %s\n", addrToURL(addr, "", useTLS))
 	fmt.Fprintf(os.Stdout, "log file: %s\n", logPath)
 	return nil
 }
 
-func resolveServicePID(addr, pidPath string) (int, error) {
+func resolveServicePID(addr string, useTLS bool, pidPath string) (int, error) {
 	pid, err := readPIDFile(pidPath)
 	if err == nil {
 		if processExists(pid) {
@@ -387,7 +439,7 @@ func resolveServicePID(addr, pidPath string) (int, error) {
 		return 0, err
 	}
 
-	if strings.TrimSpace(addr) == "" || !serverRunning(addr) {
+	if strings.TrimSpace(addr) == "" || !serverRunning(addr, useTLS) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return 0, err
 		}
@@ -414,9 +466,22 @@ func processExists(pid int) bool {
 	return processExistsPlatform(pid)
 }
 
-func serverRunning(addr string) bool {
-	url := addrToURL(addr, "/health")
-	client := &http.Client{Timeout: 800 * time.Millisecond}
+func newHTTPClient(useTLS bool, timeout time.Duration) *http.Client {
+	c := &http.Client{Timeout: timeout}
+	if useTLS {
+		// InsecureSkipVerify is used because these CLI health checks and API
+		// calls connect to the local MindFS server (loopback or same machine),
+		// which may present a self-signed certificate. No traffic leaves the host.
+		c.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+	return c
+}
+
+func serverRunning(addr string, useTLS bool) bool {
+	url := addrToURL(addr, "/health", useTLS)
+	client := newHTTPClient(useTLS, 800*time.Millisecond)
 	resp, err := client.Get(url)
 	if err != nil {
 		return false
@@ -439,8 +504,8 @@ type relayStatusResponse struct {
 	NodeURL      string `json:"node_url"`
 }
 
-func addManagedDir(addr, path string) (managedDirResponse, error) {
-	url := addrToURL(addr, "/api/dirs")
+func addManagedDir(addr string, useTLS bool, path string) (managedDirResponse, error) {
+	url := addrToURL(addr, "/api/dirs", useTLS)
 	body, err := json.Marshal(map[string]any{"path": path})
 	if err != nil {
 		return managedDirResponse{}, err
@@ -450,7 +515,7 @@ func addManagedDir(addr, path string) (managedDirResponse, error) {
 		return managedDirResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := newHTTPClient(useTLS, 3*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return managedDirResponse{}, err
@@ -470,13 +535,13 @@ func addManagedDir(addr, path string) (managedDirResponse, error) {
 	return managedDirResponse{}, fmt.Errorf("failed to add managed directory: %s", message)
 }
 
-func removeManagedDir(addr, path string) error {
-	endpoint := addrToURL(addr, "/api/dirs?path="+url.QueryEscape(path))
+func removeManagedDir(addr string, useTLS bool, path string) error {
+	endpoint := addrToURL(addr, "/api/dirs?path="+url.QueryEscape(path), useTLS)
 	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := newHTTPClient(useTLS, 3*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -508,16 +573,16 @@ func removeManagedDirFromRegistry(path string) error {
 	return app.RemoveManagedDirFromRegistry(path)
 }
 
-func handleRemoveRoot(addr, path string) error {
-	if serverRunning(addr) {
-		return removeManagedDir(addr, path)
+func handleRemoveRoot(addr string, useTLS bool, path string) error {
+	if serverRunning(addr, useTLS) {
+		return removeManagedDir(addr, useTLS, path)
 	}
 	return removeManagedDirFromRegistry(path)
 }
 
-func fetchRelayStatus(addr string) (relayStatusResponse, error) {
-	url := addrToURL(addr, "/api/relay/status")
-	client := &http.Client{Timeout: 3 * time.Second}
+func fetchRelayStatus(addr string, useTLS bool) (relayStatusResponse, error) {
+	url := addrToURL(addr, "/api/relay/status", useTLS)
+	client := newHTTPClient(useTLS, 3*time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
 		return relayStatusResponse{}, err
@@ -538,8 +603,8 @@ func fetchRelayStatus(addr string) (relayStatusResponse, error) {
 	return out, nil
 }
 
-func openTarget(addr string, rootID string) error {
-	status, err := fetchRelayStatus(addr)
+func openTarget(addr string, useTLS bool, rootID string) error {
+	status, err := fetchRelayStatus(addr, useTLS)
 	if err != nil {
 		return err
 	}
@@ -556,7 +621,7 @@ func openTarget(addr string, rootID string) error {
 		}
 		target = u.String()
 	} else {
-		target = localOpenURL(addr, rootID)
+		target = localOpenURL(addr, useTLS, rootID)
 	}
 	return openBrowser(target)
 }
@@ -572,8 +637,8 @@ func reportOpenTargetError(w io.Writer, err error) {
 	fmt.Fprintln(w, err.Error())
 }
 
-func localOpenURL(addr string, rootID string) string {
-	base := addrToURL(addr, "")
+func localOpenURL(addr string, useTLS bool, rootID string) string {
+	base := addrToURL(addr, "", useTLS)
 	u, err := url.Parse(base)
 	if err != nil {
 		return base
@@ -605,7 +670,7 @@ func openBrowser(target string) error {
 	return cmd.Start()
 }
 
-func addrToURL(addr, path string) string {
+func addrToURL(addr, path string, useTLS bool) string {
 	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
 		return addr + path
 	}
@@ -617,16 +682,23 @@ func addrToURL(addr, path string) string {
 	if host == "" {
 		host = "localhost"
 	}
+	if host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
 	if port == "" {
 		port = "7331"
 	}
-	return fmt.Sprintf("http://%s:%s%s", host, port, path)
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%s%s", scheme, host, port, path)
 }
 
-func waitForServer(addr string, timeout time.Duration) error {
+func waitForServer(addr string, useTLS bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if serverRunning(addr) {
+		if serverRunning(addr, useTLS) {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)

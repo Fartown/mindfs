@@ -3,6 +3,8 @@ import { MarkdownViewer } from "./MarkdownViewer";
 import { CodeViewer, supportsLineSelection } from "./CodeViewer";
 import { ImageViewer } from "./ImageViewer";
 import { BinaryViewer } from "./BinaryViewer";
+import { rootBadgeStyle } from "./rootBadgeStyle";
+import { downloadFile } from "../services/download";
 
 type FilePayload = {
   name: string;
@@ -94,7 +96,12 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
         <>
           <span
             onClick={() => onPathClick?.(".")}
-            style={{ fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
+            style={{
+              ...rootBadgeStyle,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              cursor: "pointer",
+            }}
             onMouseEnter={(e) => { e.currentTarget.style.textDecoration = "underline"; }}
             onMouseLeave={(e) => { e.currentTarget.style.textDecoration = "none"; }}
           >
@@ -121,6 +128,7 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
 }
 
 export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
+  const [isDownloading, setIsDownloading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const restoredScrollKeyRef = useRef("");
   const contentRootRef = useRef<HTMLDivElement | null>(null);
@@ -274,7 +282,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
         created_at: typeof value.created_at === "string" ? value.created_at : undefined,
         updated_at: typeof value.updated_at === "string" ? value.updated_at : undefined,
       };
-    }).filter((v): v is RelatedSession => Boolean(v));
+    }).filter((v): v is NonNullable<typeof v> => v !== null) as RelatedSession[];
     const dedup = new Map<string, RelatedSession>();
     normalized.forEach((item) => {
       const existing = dedup.get(item.source_session);
@@ -298,20 +306,71 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
   const relatedSessions = normalizeRelatedSessions((file as any).file_meta);
   const visibleRelatedSessions = relatedSessions.slice(0, isMobile ? 2 : 3);
 
+  const [downloadToast, setDownloadToast] = useState<{ msg: string; ok: boolean } | null>(null);
+
+  const showToast = useCallback((msg: string, ok: boolean) => {
+    setDownloadToast({ msg, ok });
+    window.setTimeout(() => setDownloadToast(null), 3000);
+  }, []);
+
+  const handleDownload = useCallback(async () => {
+    if (!file?.root || !file.path || isDownloading) {
+      return;
+    }
+    try {
+      setIsDownloading(true);
+      await downloadFile({
+        rootId: file.root,
+        path: file.path,
+        name: file.name,
+      });
+      // Android：DownloadManager 接管，通知栏会显示进度和完成，给个简单提示
+      // 浏览器端：下载已触发
+      const isAndroid = typeof window !== "undefined" && !!(window as Window & { Capacitor?: unknown }).Capacitor;
+      showToast(isAndroid ? "已加入系统下载队列，请查看通知栏或下载目录" : "下载已开始，请查看浏览器下载栏", true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "下载失败";
+      showToast(message, false);
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [file, isDownloading, showToast]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, background: "transparent" }}>
-      <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", background: "transparent", boxSizing: "border-box", zIndex: 10, flexShrink: 0 }}>
+      {/* 下载结果 toast */}
+      {downloadToast && (
+        <div style={{
+          position: "fixed",
+          bottom: "24px",
+          left: "50%",
+          transform: "translateX(-50%)",
+          background: downloadToast.ok ? "rgba(34,197,94,0.92)" : "rgba(239,68,68,0.92)",
+          color: "#fff",
+          padding: "10px 20px",
+          borderRadius: "8px",
+          fontSize: "14px",
+          fontWeight: 500,
+          zIndex: 9999,
+          pointerEvents: "none",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+          whiteSpace: "nowrap",
+        }}>
+          {downloadToast.msg}
+        </div>
+      )}
+      <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", zIndex: 10, flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", overflow: "hidden", flex: 1, minWidth: 0 }}>
           <Breadcrumbs root={file.root} path={file.path} onPathClick={onPathClick} />
           
-          {relatedSessions.length > 0 && (
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px", minWidth: 0, flexShrink: 0 }}>
+            {relatedSessions.length > 0 && (
             <div style={{ 
-              marginLeft: "16px", 
               display: "flex", 
               alignItems: "center", 
               gap: "6px", 
               minWidth: 0, 
-              flexShrink: 0 
+              flexShrink: 1
             }}>
               {/* 替换文字为图标 */}
               <svg 
@@ -372,8 +431,35 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
               </div>
             </div>
           )}
+            <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
+            <button
+              type="button"
+              onClick={() => { void handleDownload(); }}
+              disabled={!file.root || isDownloading}
+              title={isDownloading ? "下载中..." : "下载文件"}
+              aria-label={isDownloading ? "下载中..." : "下载文件"}
+              style={{
+                border: "none",
+                background: "transparent",
+                borderRadius: 6,
+                padding: 0,
+                width: 20,
+                height: 20,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: !file.root || isDownloading ? "not-allowed" : "pointer",
+                color: "var(--text-secondary)",
+                opacity: !file.root || isDownloading ? 0.6 : 1,
+                flexShrink: 0,
+              }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path fill="currentColor" d="M16.59 9H15V4c0-.55-.45-1-1-1h-4c-.55 0-1 .45-1 1v5H7.41c-.89 0-1.34 1.08-.71 1.71l4.59 4.59c.39.39 1.02.39 1.41 0l4.59-4.59c.63-.63.19-1.71-.7-1.71M5 19c0 .55.45 1 1 1h12c.55 0 1-.45 1-1s-.45-1-1-1H6c-.55 0-1 .45-1 1"/>
+              </svg>
+            </button>
+          </div>
         </div>
-        <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
       </header>
 
       <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto", position: "relative", WebkitOverflowScrolling: "touch" }}>
@@ -387,6 +473,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
               <MarkdownViewer
                 content={file.content}
                 currentPath={file.path}
+                root={file.root}
                 onFileClick={onFileClick}
                 targetLine={file.targetLine}
                 contentRef={contentRootRef}

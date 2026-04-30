@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,6 +26,7 @@ import (
 const (
 	sessionDBPath    = "sessions/session-list.db"
 	exchangeFileTpl  = "sessions/%s.jsonl"
+	auxFileTpl       = "sessions/%s.aux.jsonl"
 	selectSessionSQL = `
 SELECT key, type, model, name, related_files_json, created_at, updated_at, closed_at
 FROM sessions`
@@ -207,6 +209,12 @@ func (m *Manager) Get(_ context.Context, key string, afterSeq int) (*Session, er
 	return m.getSessionUnsafe(key, afterSeq)
 }
 
+func (m *Manager) GetExchangeAux(_ context.Context, key string, afterSeq int) (map[int][]ExchangeAux, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.loadExchangeAux(key, afterSeq)
+}
+
 func (m *Manager) List(_ context.Context, opts ListOptions) ([]*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -273,10 +281,19 @@ func (m *Manager) Search(_ context.Context, opts SearchOptions) ([]SearchHit, er
 }
 
 func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role, content, agent, mode, effort string) error {
+	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, time.Time{})
+}
+
+func (m *Manager) AddExchangeForAgentAt(_ context.Context, session *Session, role, content, agent, mode, effort string, timestamp time.Time) error {
+	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, timestamp)
+}
+
+func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, mode, effort string, timestamp time.Time) error {
 	if session == nil || strings.TrimSpace(session.Key) == "" {
 		return errors.New("session required")
 	}
-	if strings.TrimSpace(content) == "" {
+	normalizedRole := strings.ToLower(strings.TrimSpace(role))
+	if strings.TrimSpace(content) == "" && normalizedRole != "agent" && normalizedRole != "assistant" {
 		return nil
 	}
 	m.mu.Lock()
@@ -291,6 +308,10 @@ func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role,
 	}
 	resolvedAgent := strings.TrimSpace(agent)
 	nextSeq := len(session.Exchanges) + 1
+	ts := timestamp.UTC()
+	if ts.IsZero() {
+		ts = m.now().UTC()
+	}
 	record := Exchange{
 		Seq:       nextSeq,
 		Role:      role,
@@ -299,9 +320,10 @@ func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role,
 		Mode:      strings.TrimSpace(mode),
 		Effort:    strings.TrimSpace(effort),
 		Content:   content,
-		Timestamp: m.now().UTC(),
+		Timestamp: ts,
 	}
 	if err := m.appendExchange(session.Key, record); err != nil {
+		log.Printf("[session/store] append.error session=%s seq=%d role=%s agent=%s err=%v", session.Key, record.Seq, role, resolvedAgent, err)
 		return err
 	}
 	session.Exchanges = append(session.Exchanges, record)
@@ -318,6 +340,25 @@ func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role,
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) AddExchangeAux(_ context.Context, sessionKey string, aux ExchangeAux) error {
+	if strings.TrimSpace(sessionKey) == "" {
+		return errors.New("session key required")
+	}
+	if aux.Seq <= 0 {
+		return errors.New("aux seq required")
+	}
+	if aux.ToolCall == nil && strings.TrimSpace(aux.Thought) == "" {
+		return errors.New("aux content required")
+	}
+	compacted, ok := CompactExchangeAux(aux)
+	if !ok {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.appendExchangeAux(sessionKey, compacted)
 }
 
 func (m *Manager) AddRelatedFile(_ context.Context, key string, file RelatedFile) error {
@@ -633,6 +674,13 @@ func (m *Manager) deleteSessionUnsafe(key string) error {
 	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(path))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	auxPath, err := m.auxPath(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(metaDir, filepath.FromSlash(auxPath))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 
@@ -914,7 +962,7 @@ func (m *Manager) loadExchanges(key string, afterSeq int) ([]Exchange, int, erro
 	}
 	exchanges := make([]Exchange, 0)
 	total := 0
-	scanner := bufio.NewScanner(strings.NewReader(string(payload)))
+	scanner := jsonlScanner(payload)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -935,6 +983,9 @@ func (m *Manager) loadExchanges(key string, afterSeq int) ([]Exchange, int, erro
 		}
 		exchanges = append(exchanges, entry)
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, 0, err
+	}
 	return exchanges, total, nil
 }
 
@@ -944,6 +995,77 @@ func (m *Manager) appendExchange(key string, exchange Exchange) error {
 		return err
 	}
 	payload, err := json.Marshal(exchange)
+	if err != nil {
+		return err
+	}
+	file, err := m.root.OpenMetaFileAppend(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Write(append(payload, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) loadExchangeAux(key string, afterSeq int) (map[int][]ExchangeAux, error) {
+	path, err := m.auxPath(key)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := m.root.ReadMetaFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[int][]ExchangeAux{}, nil
+		}
+		return nil, err
+	}
+	items := make(map[int][]ExchangeAux)
+	scanner := jsonlScanner(payload)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry ExchangeAux
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry.Seq <= 0 {
+			continue
+		}
+		if afterSeq > 0 && entry.Seq <= afterSeq {
+			continue
+		}
+		compacted, ok := CompactExchangeAux(entry)
+		if !ok {
+			continue
+		}
+		items[compacted.Seq] = append(items[compacted.Seq], compacted)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func jsonlScanner(payload []byte) *bufio.Scanner {
+	scanner := bufio.NewScanner(strings.NewReader(string(payload)))
+	maxTokenSize := len(payload) + 1
+	if maxTokenSize < 64*1024 {
+		maxTokenSize = 64 * 1024
+	}
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTokenSize)
+	return scanner
+}
+
+func (m *Manager) appendExchangeAux(key string, aux ExchangeAux) error {
+	path, err := m.auxPath(key)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(aux)
 	if err != nil {
 		return err
 	}
@@ -969,6 +1091,19 @@ func (m *Manager) exchangePath(key string) (string, error) {
 		return "", fmt.Errorf("invalid session key: %s", key)
 	}
 	return filepath.ToSlash(fmt.Sprintf(exchangeFileTpl, key)), nil
+}
+
+func (m *Manager) auxPath(key string) (string, error) {
+	if strings.TrimSpace(m.root.MetaDir()) == "" {
+		return "", errors.New("managed dir required")
+	}
+	if key == "" {
+		return "", errors.New("session key required")
+	}
+	if strings.Contains(key, "..") || strings.ContainsRune(key, filepath.Separator) || strings.Contains(key, "/") {
+		return "", fmt.Errorf("invalid session key: %s", key)
+	}
+	return filepath.ToSlash(fmt.Sprintf(auxFileTpl, key)), nil
 }
 
 func (m *Manager) ensureSessionMetaDBUnsafe() (*sql.DB, error) {

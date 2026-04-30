@@ -11,10 +11,10 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 ## Screenshots
 
 <p align="center">
-  <img src="docs/images/mindfs-desktop.webp" alt="MindFS desktop UI" width="72%" />
+  <img src="docs/images/mindfs-desktop.webp" alt="MindFS desktop UI" width="92%" />
 </p>
 <p align="center">
-  <img src="docs/images/mindfs-mobile.webp" alt="MindFS mobile UI" width="28%" />
+  <img src="docs/images/mindfs-mobile.webp" alt="MindFS mobile UI" width="92%" />
 </p>
 
 ---
@@ -24,10 +24,10 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 ### Agent Sessions
 
 - **Multi-Agent support**: Claude Code · OpenAI Codex · Gemini CLI · Cursor · GitHub Copilot · Cline · Augment · Kimi · Kiro · Qwen · Qoder · Pi · OpenCode · OpenClaw — installed agents are detected automatically.
-- **Real-time streaming**: Token-by-token output pushed to the browser; tool calls, thought traces, and permission prompts rendered as structured, collapsible cards.
+- **Real-time streaming**: Token-by-token output pushed to the browser; tool calls, thought traces, permission prompts, and remaining context-window capacity are rendered live as structured, collapsible cards.
 - **Flexible switching**: Switch agents or models mid-session; all agents share the same context — no need to re-explain the background.
 - **Session search**: Search by session title or conversation content, then jump straight to the matched session and snippet.
-- **External session both-way import**: Browse existing sessions from supported agent CLIs, import one into MindFS, and continue it as a native MindFS session. MindFS session can resumed in agent cli too.
+- **External session both-way import&synchronization**: Browse existing sessions from supported agent CLIs, import one into MindFS, and continue it as a native MindFS session. MindFS session can resumed in agent cli too. Bidirectional synchronization is also possible.
 - **Binding persistence and recovery**: MindFS persists the mapping between its internal session and the underlying agent session, so the link can be restored after service restarts and follow-up messages continue on the same agent session when available.
 - **Rich media input**: Attach files and images directly in your messages.
 - **Multi-device sync**: Access the same instance from multiple devices simultaneously with live session sync.
@@ -42,8 +42,9 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 
 - **`/` slash commands**: Type `/` to trigger a command palette and quickly run preset operations.
 - **`@` file references**: Type `@` to trigger path completion and attach any file as context for the agent.
+- **`#` quick prompts**: Type `#` to trigger your saved prompt shortcuts inline.
 - **Bidirectional file–session linking**: Jump from a file to the session that created it, or from a session to all files it touched.
-- **Browser app (PWA)**: Install to desktop or mobile home screen for a native-like experience — no app store required.
+- **Android, Browser app (PWA)**: Install to desktop or mobile home screen for a native-like experience — no app store required.
 - **Mobile-optimized UI**: Bottom action bar within thumb reach, independent panel swipe navigation, input box adapts to the soft keyboard.
 
 ### Access Modes
@@ -51,6 +52,7 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 - **Local mode**: Accessible in the browser on the local machine immediately after startup — no account or configuration needed.
 - **Relay remote mode**: Access your local instance from anywhere on the public internet without opening firewall ports, via an encrypted tunnel through [a9gent.com](https://a9gent.com). Click the bind button in the local UI to activate.
 - **Private channel**: Use a private network (e.g. Tailscale) and access directly via `ip:port`.
+- **End-to-end encryption**: Sessions and files can be protected with end-to-end encryption.
 
 ### Plugin System
 
@@ -60,7 +62,7 @@ Access your personal AI agents and workstation data anywhere, anytime through Mi
 
 ### Installation
 
-- **Single binary**: The production build is a statically compiled binary with all web assets embedded.
+- **Single binary**: The production build is a statically compiled binary with all web assets embedded, and the install package is under 10 MB.
 - **Zero dependencies**: No Node.js, Docker, or daemon manager required on the host.
 - **Cross-platform**: macOS (Intel + Apple Silicon), Linux (x86-64, ARM64, ARMv7), Windows (x86-64, ARM64).
 
@@ -127,6 +129,23 @@ mindfs -addr :9000 /path/to/your/project  # custom port
 
 Open [http://localhost:7331](http://localhost:7331) in your browser.
 
+#### HTTPS (TLS)
+
+Enable HTTPS with a self-signed certificate (auto-generated and reused across restarts):
+
+```bash
+mindfs -tls
+mindfs -tls -addr :9000 /path/to/your/project
+```
+
+Open [https://localhost:7331](https://localhost:7331) in your browser. The auto-generated certificate includes SANs for `localhost`, `127.0.0.1`, `::1`, and all non-loopback interface IPs, so LAN clients can connect without certificate name mismatches. Certificates are stored under the user config directory (e.g., `~/.config/mindfs/` on Linux).
+
+Use custom certificate and key files:
+
+```bash
+mindfs -tls -cert /path/to/cert.pem -key /path/to/key.pem
+```
+
 MindFS automatically detects the availability of installed agents. This usually takes about one minute.
 
 ### Enable Remote Access (Optional)
@@ -144,6 +163,9 @@ Flags:
   -addr string   Listen address (default "127.0.0.1:7331")
   -no-relayer    Disable relay integration
   -remove        Unregister a managed directory from a running server
+  -tls           Enable HTTPS (auto-generates self-signed cert if -cert/-key not provided)
+  -cert string   TLS certificate file (PEM); requires -tls
+  -key string    TLS private key file (PEM); requires -tls
 ```
 
 ---
@@ -158,3 +180,6 @@ Pull requests are welcome. For larger changes, please open an issue first to dis
 ## License
 
 [AGPL v3](LICENSE)
+
+## Friend Links
+<a href="https://linux.do">Linux.do</a>

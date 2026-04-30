@@ -1,4 +1,7 @@
 import React from "react";
+import { rootBadgeStyle } from "./rootBadgeStyle";
+import { openExternalURL } from "../services/platformNavigation";
+import { isCapacitorRuntime, shouldEnablePWAInstall } from "../services/runtime";
 import {
   DIRECTORY_SORT_OPTIONS,
   type DirectorySortMode,
@@ -71,6 +74,7 @@ type FileTreeProps = {
   updateActionBusy?: boolean;
   updateActionSummary?: string | null;
   onUpdateAction?: () => void;
+  onGoHome?: () => void;
 };
 
 const ChevronRight = ({ isOpen }: { isOpen: boolean }) => (
@@ -161,6 +165,7 @@ export function FileTree({
   updateActionBusy = false,
   updateActionSummary = null,
   onUpdateAction,
+  onGoHome,
 }: FileTreeProps) {
   const expandedSet = new Set(expanded);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
@@ -227,6 +232,16 @@ export function FileTree({
     return isAndroid && isChrome && !isExcluded;
   }, []);
 
+  const isAndroidApp = React.useMemo(() => {
+    if (!isCapacitorRuntime() || typeof window === "undefined") {
+      return false;
+    }
+    const platform = (window as Window & {
+      Capacitor?: { getPlatform?: () => string };
+    }).Capacitor?.getPlatform?.();
+    return platform === "android";
+  }, []);
+
   const isDesktopChromium = React.useMemo(() => {
     if (typeof window === "undefined") {
       return false;
@@ -270,7 +285,10 @@ export function FileTree({
   }, []);
 
   React.useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === "undefined" || !shouldEnablePWAInstall()) {
+      setDeferredInstallPrompt(null);
+      setIsInstalled(false);
+      setIsInstallCapable(false);
       return;
     }
 
@@ -349,8 +367,8 @@ export function FileTree({
         ? "安装后可从桌面独立启动"
         : "当前浏览器未提供安装弹窗";
 
-  const shouldShowInstallButton = !isKnownInstalled && !(isAndroidChrome && !deferredInstallPrompt);
-  const shouldShowInstallHelp = (!!installHelp) && (isKnownInstalled || isIOS || isMacSafari || isDesktopChromium || deferredInstallPrompt !== null || (isAndroidChrome && !deferredInstallPrompt));
+  const shouldShowInstallButton = !isAndroidApp && !isKnownInstalled && !(isAndroidChrome && !deferredInstallPrompt);
+  const shouldShowInstallHelp = !isAndroidApp && (!!installHelp) && (isKnownInstalled || isIOS || isMacSafari || isDesktopChromium || deferredInstallPrompt !== null || (isAndroidChrome && !deferredInstallPrompt));
   const visibleRelayTips = React.useMemo(
     () => relayTips.filter((tip) => tip.id && tip.title && !dismissedRelayTipIds.includes(tip.id)),
     [dismissedRelayTipIds, relayTips],
@@ -366,6 +384,7 @@ export function FileTree({
     !!relayActionLabel ||
     !!relayActionHelp ||
     shouldShowRelayTip ||
+    (isAndroidApp && !!onGoHome) ||
     shouldShowInstallButton ||
     shouldShowInstallHelp;
 
@@ -399,10 +418,10 @@ export function FileTree({
       return;
     }
     if (relayTip.target === "_self") {
-      window.location.href = relayTip.href;
+      window.location.assign(relayTip.href);
       return;
     }
-    window.open(relayTip.href, "_blank", "noopener,noreferrer");
+    openExternalURL(relayTip.href);
   }, [relayTip]);
 
   const handleInstall = React.useCallback(async () => {
@@ -617,10 +636,11 @@ export function FileTree({
         const cKey = childKeyFor(entry, entryRoot);
         const children = childrenByPath[cKey] ?? [];
         
-        // 关键修复：增加 rootId 匹配校验，防止不同 root 下同名目录同时高亮
+        const isCurrentRootNode = isManagedRootNode && entry.path === rootId;
+        // 普通目录沿用 selectedDirKey；当前 managed root 永远跟随 current root 高亮。
         const isSelected =
           entry.is_dir
-            ? selectedDirKey === expandedKey
+            ? isCurrentRootNode || selectedDirKey === expandedKey
             : entry.path === selectedPath && entryRoot === rootId;
 
         const meta = fileMetas[entry.path];
@@ -661,8 +681,25 @@ export function FileTree({
               <div style={{ width: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                  {entry.is_dir ? <ChevronRight isOpen={isOpen} /> : getFileIcon(entry.name)}
               </div>
-              <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, marginLeft: "4px" }}>
-                {entry.name}
+              <span
+                style={{
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  flex: 1,
+                  marginLeft: "4px",
+                }}
+              >
+                <span
+                  style={{
+                    ...(isManagedRootNode ? rootBadgeStyle : {}),
+                    maxWidth: "100%",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {entry.name}
+                </span>
               </span>
               {showRootIndicator ? (
                 <span
@@ -698,7 +735,7 @@ export function FileTree({
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div style={{ position: "relative", height: "36px", padding: "0 3px 0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center", boxSizing: "border-box", flexShrink: 0, gap: 12, overflow: "visible" }}>
+      <div style={{ position: "relative", height: "36px", padding: "0 3px 0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0, gap: 12, overflow: "visible" }}>
         <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>Project</h3>
         <div ref={menuRef} style={{ position: "relative" }}>
           <button
@@ -1164,6 +1201,29 @@ export function FileTree({
           <div style={{ fontSize: "11px", color: "var(--text-secondary)", lineHeight: 1.5, textAlign: "center" }}>
             {relayActionHelp}
           </div>
+        ) : null}
+        {isAndroidApp && onGoHome ? (
+          <button
+            type="button"
+            onClick={() => onGoHome()}
+            style={{
+              width: "100%",
+              border: "1px solid var(--border-color)",
+              background: "var(--text-primary)",
+              color: "var(--sidebar-bg)",
+              borderRadius: "10px",
+              padding: "10px 12px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "8px",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+            }}
+          >
+            <span>回到节点页</span>
+          </button>
         ) : null}
         {shouldShowInstallButton ? (
           <button

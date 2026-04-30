@@ -12,6 +12,12 @@ type Session interface {
 	// SendMessage sends a message to the current session.
 	SendMessage(ctx context.Context, content string) error
 
+	// AnswerQuestion sends a response for a pending AskUserQuestion tool call.
+	AnswerQuestion(ctx context.Context, answer AskUserAnswer) error
+
+	// CurrentModel returns the model currently used by the runtime session.
+	CurrentModel() string
+
 	// SetModel updates the model used by the current session.
 	SetModel(ctx context.Context, model string) error
 
@@ -36,8 +42,16 @@ type Session interface {
 	// SessionID returns the current session ID.
 	SessionID() string
 
+	// ContextWindow returns the latest known context window usage for the session.
+	ContextWindow(ctx context.Context) (ContextWindow, error)
+
 	// Close terminates the session (not the process).
 	Close() error
+}
+
+type ContextWindow struct {
+	TotalTokens        int `json:"totalTokens"`
+	ModelContextWindow int `json:"modelContextWindow"`
 }
 
 type OpenSessionInput struct {
@@ -77,6 +91,7 @@ type ImportExternalSessionInput struct {
 	RootPath       string
 	Agent          string
 	AgentSessionID string
+	AfterTimestamp time.Time
 }
 
 type ImportedExchange struct {
@@ -140,7 +155,9 @@ const (
 	EventTypeThoughtChunk EventType = "thought_chunk"
 	EventTypeToolCall     EventType = "tool_call"
 	EventTypeToolUpdate   EventType = "tool_update"
+	EventTypeTodoUpdate   EventType = "todo_update"
 	EventTypeMessageDone  EventType = "message_done"
+	EventTypeRecovery     EventType = "recovery"
 )
 
 // Event is a normalized session update emitted by any agent backend.
@@ -158,6 +175,41 @@ type ThoughtChunk struct {
 	Content string `json:"content"`
 }
 
+type MessageDone struct {
+	ContextWindow ContextWindow `json:"contextWindow"`
+}
+
+type RecoveryStatus struct {
+	Message string `json:"message"`
+}
+
+type TodoItem struct {
+	Content    string `json:"content"`
+	ActiveForm string `json:"activeForm,omitempty"`
+	Status     string `json:"status"`
+}
+
+type TodoUpdate struct {
+	Items []TodoItem `json:"items"`
+}
+
+type AskUserQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+type AskUserQuestionItem struct {
+	Question    string                  `json:"question"`
+	Header      string                  `json:"header,omitempty"`
+	Options     []AskUserQuestionOption `json:"options,omitempty"`
+	MultiSelect bool                    `json:"multiSelect,omitempty"`
+}
+
+type AskUserAnswer struct {
+	ToolUseID string            `json:"toolUseId"`
+	Answers   map[string]string `json:"answers"`
+}
+
 type ToolKind string
 
 const (
@@ -166,9 +218,13 @@ const (
 	ToolKindDelete     ToolKind = "delete"
 	ToolKindMove       ToolKind = "move"
 	ToolKindSearch     ToolKind = "search"
+	ToolKindWebSearch  ToolKind = "web_search"
 	ToolKindExecute    ToolKind = "execute"
 	ToolKindThink      ToolKind = "think"
 	ToolKindFetch      ToolKind = "fetch"
+	ToolKindTask       ToolKind = "task"
+	ToolKindAskUser    ToolKind = "ask_user"
+	ToolKindTodo       ToolKind = "todo"
 	ToolKindSwitchMode ToolKind = "switch_mode"
 	ToolKindOther      ToolKind = "other"
 )
