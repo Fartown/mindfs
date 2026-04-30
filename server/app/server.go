@@ -2,24 +2,61 @@ package app
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mindfs/server/internal/agent"
 	"mindfs/server/internal/api"
+	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
+	"mindfs/server/internal/preferences"
 	"mindfs/server/internal/relay"
+	"mindfs/server/internal/tlsutil"
 	"mindfs/server/internal/update"
 )
+
+const staticDirEnvKey = "MINDFS_STATIC_DIR"
 
 type StartOptions struct {
 	NoRelayer    bool
 	RelayBaseURL string
 	Version      string
 	Args         []string
+	E2EEConfig   E2EEConfig
+	UseTLS       bool
+	CertFile     string
+	KeyFile      string
+}
+
+type E2EEConfig struct {
+	Enabled       bool
+	NodeID        string
+	PairingSecret string
+}
+
+type E2EEEnsureResult struct {
+	Config    E2EEConfig
+	Generated bool
+}
+
+func EnsureE2EEConfig(enabled bool) (E2EEEnsureResult, error) {
+	result, err := e2ee.EnsureConfig(enabled)
+	if err != nil {
+		return E2EEEnsureResult{}, err
+	}
+	return E2EEEnsureResult{
+		Config: E2EEConfig{
+			Enabled:       result.Config.Enabled,
+			NodeID:        result.Config.NodeID,
+			PairingSecret: result.Config.PairingSecret,
+		},
+		Generated: result.Generated,
+	}, nil
 }
 
 // Start boots the HTTP/WS server.
@@ -43,6 +80,10 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	agentPool := agent.NewPool(agentConfig)
 	agentProber := agent.NewProber(&agentConfig, agentPool, 5*time.Minute)
 	agentProber.Start(ctx)
+	prefs, err := preferences.NewStore()
+	if err != nil {
+		log.Printf("[preferences] init.error err=%v", err)
+	}
 	executable, _ := os.Executable()
 	updateSvc := update.NewService("a9gent/mindfs", opts.Version, executable, opts.Args, 10*time.Minute)
 	updateSvc.Start(ctx)
@@ -52,6 +93,12 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		Agents: agentPool,
 		Prober: agentProber,
 		Update: updateSvc,
+		Prefs:  prefs,
+		E2EE: e2ee.NewManager(e2ee.Config{
+			Enabled:       opts.E2EEConfig.Enabled,
+			NodeID:        opts.E2EEConfig.NodeID,
+			PairingSecret: opts.E2EEConfig.PairingSecret,
+		}),
 	}
 	githubImportSvc, err := githubimport.NewService(services)
 	if err != nil {
@@ -76,7 +123,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	relayMgr, err := relay.NewManager(addr, opts.NoRelayer, relayBaseURL)
+	relayMgr, err := relay.NewManager(addr, opts.NoRelayer, relayBaseURL, opts.UseTLS)
 	if err != nil {
 		return err
 	}
@@ -94,10 +141,32 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		server.Shutdown(context.Background())
 	}()
 
+	if services.E2EE != nil {
+		services.E2EE.StartCleanup(ctx.Done())
+	}
+
+	if opts.UseTLS {
+		return server.ListenAndServeTLS(opts.CertFile, opts.KeyFile)
+	}
 	return server.ListenAndServe()
 }
 
 func resolveStaticDir() string {
+	if hinted := strings.TrimSpace(os.Getenv(staticDirEnvKey)); hinted != "" {
+		if info, err := os.Stat(hinted); err == nil && info.IsDir() {
+			return hinted
+		}
+	}
+
+	if shouldPreferWorkingDirStaticDir() {
+		if exe, err := os.Executable(); err == nil {
+			candidate := filepath.Join(filepath.Dir(exe), "web", "dist")
+			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+				return candidate
+			}
+		}
+	}
+
 	if exe, err := os.Executable(); err == nil {
 		prefix := filepath.Dir(filepath.Dir(exe))
 		candidate := filepath.Join(prefix, "share", "mindfs", "web")
@@ -114,6 +183,17 @@ func resolveStaticDir() string {
 	return ""
 }
 
+func shouldPreferWorkingDirStaticDir() bool {
+	if len(os.Args) == 0 {
+		return false
+	}
+	arg0 := strings.TrimSpace(os.Args[0])
+	if arg0 == "" {
+		return false
+	}
+	return strings.HasPrefix(arg0, "."+string(os.PathSeparator))
+}
+
 func RemoveManagedDirFromRegistry(path string) error {
 	registry, err := fs.NewDefaultRegistry()
 	if err != nil {
@@ -124,4 +204,11 @@ func RemoveManagedDirFromRegistry(path string) error {
 	}
 	_, err = registry.Remove(path)
 	return err
+}
+
+// EnsureTLSCert resolves TLS certificate and key file paths for the server.
+// When certFlag or keyFlag are empty, a self-signed certificate is generated
+// under os.UserConfigDir/mindfs/ and reused across restarts.
+func EnsureTLSCert(certFlag, keyFlag string) (string, string, error) {
+	return tlsutil.EnsureCert(certFlag, keyFlag)
 }

@@ -1,4 +1,5 @@
 import { appURL, wsURL } from "./base";
+import { e2eeService } from "./e2ee";
 
 // Session service for managing agent sessions
 
@@ -8,6 +9,13 @@ export type RelatedFile = {
   path: string;
   relation?: string;
   created_by_session?: boolean;
+};
+
+export type ExchangeAux = {
+  seq: number;
+  line: number;
+  toolcall?: ToolCall | null;
+  thought?: string | null;
 };
 
 export type Session = {
@@ -21,7 +29,12 @@ export type Session = {
   created_at: string;
   updated_at: string;
   closed_at?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
   related_files?: RelatedFile[];
+  exchange_aux?: Record<string, ExchangeAux[]>;
   exchanges?: Array<{
     seq?: number;
     role?: string;
@@ -30,8 +43,13 @@ export type Session = {
     mode?: string;
     effort?: string;
     content?: string;
+    context_window?: {
+      totalTokens: number;
+      modelContextWindow: number;
+    };
     timestamp?: string;
     toolCall?: ToolCall;
+    todoUpdate?: TodoUpdate;
     pending_ack?: boolean;
   }>;
 };
@@ -82,12 +100,32 @@ export type ToolCall = {
   rawType?: string;
 };
 
+export type TodoItem = {
+  content: string;
+  activeForm?: string;
+  status: string;
+};
+
+export type TodoUpdate = {
+  items: TodoItem[];
+};
+
 export type StreamEvent =
   | { type: "message_chunk"; data: { content: string } }
   | { type: "thought_chunk"; data: { content: string } }
   | { type: "tool_call"; data: ToolCall }
   | { type: "tool_call_update"; data: ToolCall }
-  | { type: "message_done"; data?: Record<string, never> }
+  | { type: "todo_update"; data: TodoUpdate }
+  | { type: "recovery"; data: { message: string } }
+  | {
+      type: "message_done";
+      data?: {
+        contextWindow?: {
+          totalTokens: number;
+          modelContextWindow: number;
+        };
+      };
+    }
   | { type: "error"; data: { message: string } };
 
 export type SyncSessionResult = {
@@ -145,6 +183,7 @@ class SessionService {
   private contextCache = new Map<string, { selectionKey: string }>();
 
   constructor() {
+    e2eeService.setClientId(this.clientId);
     if (typeof window !== "undefined") {
       window.addEventListener("online", () => this.ensureConnection());
       window.addEventListener("pageshow", () => this.ensureConnection());
@@ -199,18 +238,28 @@ class SessionService {
         this.emit({ type: "ws.connected" });
       }
       this.hasConnected = true;
+      if (e2eeService.isRequired() && e2eeService.hasSecret()) {
+        void e2eeService.ensureSession().catch((err) => {
+          console.error("[Session] Failed to open E2EE session:", err);
+        });
+      }
       this.resendPendingMessages();
     };
 
     ws.onmessage = (event) => {
       if (this.ws !== ws) return;
       this.clearProbe();
-      try {
-        const msg = JSON.parse(event.data);
-        this.handleMessage(msg);
-      } catch (err) {
-        console.error("[Session] Failed to parse message:", err);
-      }
+      void (async () => {
+        try {
+          const msg = await this.parseWSMessage(event.data);
+          if (!msg) {
+            return;
+          }
+          this.handleMessage(msg);
+        } catch (err) {
+          console.error("[Session] Failed to parse message:", err);
+        }
+      })();
     };
 
     ws.onclose = () => {
@@ -288,13 +337,13 @@ class SessionService {
     if (this.activeProbeId) return;
     const probeId = this.createRequestId("ping");
     this.activeProbeId = probeId;
-    this.ws.send(
-      JSON.stringify({
-        id: probeId,
-        type: "ping",
-        payload: {},
-      }),
-    );
+    void this.sendWSMessage({
+      id: probeId,
+      type: "ping",
+      payload: {},
+    }).catch((err) => {
+      console.error("[Session] Failed to send probe:", err);
+    });
     this.probeTimeoutTimer = window.setTimeout(() => {
       if (this.activeProbeId !== probeId) return;
       console.warn("[Session] WebSocket probe timed out, reconnecting");
@@ -362,6 +411,12 @@ class SessionService {
     if (type === "pong") {
       return;
     }
+    if (type === "e2ee.error") {
+      const code = typeof payload.code === "string" ? payload.code : "";
+      e2eeService.handleServerError(code);
+      this.emit({ type, payload });
+      return;
+    }
     const sessionKey = payload.session_key as string;
     if (type === "session.accepted") {
       const requestId =
@@ -377,13 +432,23 @@ class SessionService {
       this.pendingMessages.delete(msg.id);
       payload.request_id = msg.id;
     }
-    this.emit({ type, sessionKey, payload });
+    this.emitDecrypted(type, sessionKey, payload, msg);
+  }
+
+  private emitDecrypted(
+    type: string,
+    sessionKey: string,
+    payload: Record<string, unknown>,
+    msg: any,
+  ) {
+    const nextPayload = { ...payload };
+    this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
 
     const handlers = this.handlers.get(sessionKey);
     if ((!handlers || handlers.size === 0) && type === "session.stream") {
-      const event = payload.event as StreamEvent;
+      const event = nextPayload.event as StreamEvent;
       if (event) {
         const queued = this.pendingStreams.get(sessionKey) || [];
         queued.push(event);
@@ -396,7 +461,7 @@ class SessionService {
     switch (type) {
       case "session.stream":
         for (const handler of handlers) {
-          handler.onStream?.(payload.event as StreamEvent);
+          handler.onStream?.(nextPayload.event as StreamEvent);
         }
         break;
       case "session.done":
@@ -410,6 +475,32 @@ class SessionService {
         }
         break;
     }
+  }
+
+  private async parseWSMessage(raw: unknown): Promise<any | null> {
+    if (typeof raw !== "string") {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (!e2eeService.isRequired() || parsed?.type === "e2ee.error") {
+      return parsed;
+    }
+    return e2eeService.decodeWSMessage<any>(raw);
+  }
+
+  private async sendWSMessage(
+    message: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    let serialized = JSON.stringify(message);
+    if (e2eeService.isRequired()) {
+      await e2eeService.ensureSession();
+      serialized = await e2eeService.encodeWSMessage(message);
+    }
+    this.ws.send(serialized);
+    return true;
   }
 
   subscribeEvents(listener: (event: SessionServiceEvent) => void) {
@@ -490,9 +581,7 @@ class SessionService {
     };
 
     this.pendingMessages.set(requestId, { id: requestId, message: msg });
-    console.info("[session/send]", { requestId, rootId, sessionKey: sessionKey || null, agent, model: model || null });
-    this.ws.send(JSON.stringify(msg));
-    return true;
+    return this.sendWSMessage(msg);
   }
 
   private resendPendingMessages() {
@@ -500,7 +589,9 @@ class SessionService {
       return;
     }
     for (const pending of this.pendingMessages.values()) {
-      this.ws.send(JSON.stringify(pending.message));
+      void this.sendWSMessage(pending.message).catch((err) => {
+        console.error("[Session] Failed to resend message:", err);
+      });
     }
   }
 
@@ -522,8 +613,37 @@ class SessionService {
       },
     };
 
-    this.ws.send(JSON.stringify(msg));
-    return true;
+    return this.sendWSMessage(msg);
+  }
+
+  async answerQuestion(
+    rootId: string,
+    sessionKey: string,
+    agent: string | undefined,
+    toolUseId: string,
+    answers: Record<string, string>,
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.error("[Session] WebSocket not connected");
+      return false;
+    }
+    if (!rootId || !sessionKey || !toolUseId) {
+      return false;
+    }
+
+    const msg = {
+      id: this.createRequestId("answer"),
+      type: "session.answer_question",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+        agent,
+        tool_use_id: toolUseId,
+        answers,
+      },
+    };
+
+    return this.sendWSMessage(msg);
   }
 
   async markSessionReady(rootId: string, sessionKey: string): Promise<boolean> {
@@ -533,17 +653,17 @@ class SessionService {
     if (!rootId || !sessionKey) {
       return false;
     }
-    this.ws.send(
-      JSON.stringify({
-        id: `ready-${Date.now()}`,
-        type: "session.ready",
-        payload: {
-          root_id: rootId,
-          session_key: sessionKey,
-        },
-      }),
-    );
-    return true;
+    if (e2eeService.isRequired()) {
+      await e2eeService.ensureSession();
+    }
+    return this.sendWSMessage({
+      id: `ready-${Date.now()}`,
+      type: "session.ready",
+      payload: {
+        root_id: rootId,
+        session_key: sessionKey,
+      },
+    });
   }
 
   async fetchSessions(
@@ -589,7 +709,9 @@ class SessionService {
         throw new Error("Failed to search sessions");
       }
       const data = await res.json();
-      return Array.isArray(data?.items) ? (data.items as SessionSearchHit[]) : [];
+      return Array.isArray(data?.items)
+        ? (data.items as SessionSearchHit[])
+        : [];
     } catch (err) {
       console.error("[Session] Failed to search sessions:", err);
       return [];
@@ -602,20 +724,38 @@ class SessionService {
     seq?: number,
   ): Promise<Session | null> {
     try {
-      const params = new URLSearchParams({
-        root: rootId,
-        client_id: this.clientId,
-      });
+      const params = new URLSearchParams({ root: rootId });
       if (typeof seq === "number" && seq > 0) {
         params.set("seq", String(seq));
       }
+      if (e2eeService.isRequired()) {
+        if (!(await e2eeService.ensureSession())) {
+          return null;
+        }
+      }
+      const headers = e2eeService.isRequired()
+        ? e2eeService.sessionProtectedHeaders()
+        : undefined;
       const res = await fetch(
         appURL(`/api/sessions/${encodeURIComponent(sessionKey)}`, params),
+        {
+          headers,
+        },
       );
       if (!res.ok) {
+        if (res.status === 401 && e2eeService.isRequired()) {
+          const payload = (await res.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          if (e2eeService.handleServerError(String(payload.error || ""))) {
+            return this.getSession(rootId, sessionKey, seq);
+          }
+        }
         throw new Error("Failed to get session");
       }
-      const data = await res.json();
+      const data = await (e2eeService.isRequired()
+        ? e2eeService.parseProtectedJSONResponse<Session>(res)
+        : res.json());
       return data as Session;
     } catch (err) {
       console.error("[Session] Failed to get session:", err);
@@ -697,7 +837,10 @@ class SessionService {
     try {
       const params = new URLSearchParams({ root: rootId });
       const res = await fetch(
-        appURL(`/api/sessions/${encodeURIComponent(sessionKey)}/rename`, params),
+        appURL(
+          `/api/sessions/${encodeURIComponent(sessionKey)}/rename`,
+          params,
+        ),
         {
           method: "POST",
           headers: {
@@ -861,6 +1004,49 @@ function getSessionMaxSeq(session: Session | null | undefined): number {
   }, 0);
 }
 
+function cloneExchangeAux(
+  exchangeAux?: Record<string, ExchangeAux[]>,
+): Record<string, ExchangeAux[]> {
+  const out: Record<string, ExchangeAux[]> = {};
+  for (const [seq, items] of Object.entries(exchangeAux || {})) {
+    out[seq] = Array.isArray(items) ? [...items] : [];
+  }
+  return out;
+}
+
+function toPersistentExchangeAux(
+  exchangeAux?: Record<string, ExchangeAux[]>,
+): Record<string, ExchangeAux[]> {
+  const out: Record<string, ExchangeAux[]> = {};
+  for (const [seq, items] of Object.entries(exchangeAux || {})) {
+    const seqNum = Number(seq || 0);
+    if (!Number.isFinite(seqNum) || seqNum <= 0) {
+      continue;
+    }
+    const nextItems = Array.isArray(items)
+      ? items.filter((item) => Number(item?.seq || 0) > 0)
+      : [];
+    if (nextItems.length > 0) {
+      out[String(seqNum)] = nextItems;
+    }
+  }
+  return out;
+}
+
+function appendExchangeAuxDelta(
+  base?: Record<string, ExchangeAux[]>,
+  incoming?: Record<string, ExchangeAux[]>,
+): Record<string, ExchangeAux[]> {
+  const out = cloneExchangeAux(base);
+  for (const [seq, items] of Object.entries(incoming || {})) {
+    if (!Array.isArray(items) || items.length === 0) {
+      continue;
+    }
+    out[seq] = [...(out[seq] || []), ...items];
+  }
+  return out;
+}
+
 function preferIncomingText(next?: string, prev?: string) {
   const normalizedNext = (next || "").trim();
   if (normalizedNext) {
@@ -898,8 +1084,10 @@ function withSessionMeta(
     agent: preferIncomingText(incoming.agent, base.agent),
     model: preferIncomingText((incoming as any).model, (base as any).model),
     mode: preferIncomingText((incoming as any).mode, (base as any).mode),
+    effort: preferIncomingText((incoming as any).effort, (base as any).effort),
     name: preferIncomingText(incoming.name, base.name) || "",
     exchanges: Array.isArray(incoming.exchanges) ? [...incoming.exchanges] : [],
+    exchange_aux: cloneExchangeAux(incoming.exchange_aux || base.exchange_aux),
   };
 }
 
@@ -921,9 +1109,12 @@ function appendSessionDelta(
         (exchange) => Number((exchange as any)?.seq || 0) > 0,
       )
     : [];
+  const baseExchangeAux = toPersistentExchangeAux(base?.exchange_aux);
+  const incomingExchangeAux = toPersistentExchangeAux(incoming?.exchange_aux);
   return {
     ...baseWithMeta,
     exchanges: [...baseExchanges, ...incomingExchanges],
+    exchange_aux: appendExchangeAuxDelta(baseExchangeAux, incomingExchangeAux),
   };
 }
 
@@ -987,6 +1178,7 @@ function cloneSession(session: Session): Session {
       ? [...session.related_files]
       : [],
     exchanges: Array.isArray(session.exchanges) ? [...session.exchanges] : [],
+    exchange_aux: cloneExchangeAux(session.exchange_aux),
   };
 }
 
@@ -999,6 +1191,7 @@ function toPersistentSession(session: Session): Session {
           return Number.isFinite(seq) && seq > 0;
         })
       : [],
+    exchange_aux: toPersistentExchangeAux(session.exchange_aux),
   };
 }
 
@@ -1051,6 +1244,7 @@ export async function syncSession(
     ...incoming,
     key: sessionKey,
     exchanges: persistedDelta,
+    exchange_aux: toPersistentExchangeAux(incoming.exchange_aux),
   });
   if (!persistedSession) {
     return { session: null, hasDelta: false };
@@ -1060,6 +1254,7 @@ export async function syncSession(
     ...incoming,
     key: sessionKey,
     exchanges: [...(persistedSession.exchanges || []), ...transientTail],
+    exchange_aux: persistedSession.exchange_aux,
   });
   return {
     session: displaySession ? cloneSession(displaySession) : null,

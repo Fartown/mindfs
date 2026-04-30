@@ -18,6 +18,7 @@ import {
   type Session,
 } from "./services/session";
 import { buildClientContext } from "./services/context";
+import { e2eeService, type E2EEState } from "./services/e2ee";
 import { reportError } from "./services/error";
 import {
   fetchFile,
@@ -46,6 +47,10 @@ import {
 } from "./plugins/manager";
 import { appPath, appURL, isRelayNodePage } from "./services/base";
 import { triggerUpdate, type UpdateState } from "./services/update";
+import {
+  cancelScheduledWebViewCacheClear,
+  scheduleWebViewCacheClearOnNextLaunch,
+} from "./services/nativeCacheControl";
 
 // 直接导入标准组件
 import { AppShell } from "./layout/AppShell";
@@ -101,6 +106,22 @@ export type SessionItem = {
   pending?: boolean;
 };
 
+function latestExchangeText(
+  exchanges: unknown,
+  field: "agent" | "mode" | "effort",
+): string {
+  if (!Array.isArray(exchanges)) {
+    return "";
+  }
+  for (let i = exchanges.length - 1; i >= 0; i -= 1) {
+    const value = (exchanges[i] as Record<string, unknown> | null)?.[field];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
+}
+
 function toSessionItem(
   rootID: string | null | undefined,
   session: any,
@@ -123,10 +144,19 @@ function toSessionItem(
       session?.type === "plugin" || session?.type === "chat"
         ? session.type
         : "chat",
-    agent: typeof session?.agent === "string" ? session.agent : "",
+    agent:
+      typeof session?.agent === "string" && session.agent.trim()
+        ? session.agent
+        : latestExchangeText(session?.exchanges, "agent"),
     model: typeof session?.model === "string" ? session.model : "",
-    mode: typeof session?.mode === "string" ? session.mode : "",
-    effort: typeof session?.effort === "string" ? session.effort : "",
+    mode:
+      typeof session?.mode === "string" && session.mode.trim()
+        ? session.mode
+        : latestExchangeText(session?.exchanges, "mode"),
+    effort:
+      typeof session?.effort === "string" && session.effort.trim()
+        ? session.effort
+        : latestExchangeText(session?.exchanges, "effort"),
     scope: typeof session?.scope === "string" ? session.scope : "",
     purpose: typeof session?.purpose === "string" ? session.purpose : "",
     created_at:
@@ -157,8 +187,13 @@ type Exchange = {
   mode?: string;
   effort?: string;
   content?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
   timestamp?: string;
   toolCall?: any;
+  todoUpdate?: any;
   pending_ack?: boolean;
 };
 type PendingSend = {
@@ -225,9 +260,11 @@ type RelayStatusPayload = {
   pending_code?: string;
   node_name?: string;
   node_id?: string;
+  e2ee_node_id?: string;
   relay_base_url?: string;
   node_url?: string;
   last_error?: string;
+  e2ee_required?: boolean;
 };
 const RELAY_LAST_NODE_ID_STORAGE_KEY = "mindfs.relay.last_node_id";
 const PLUGIN_QUERY_STORAGE_PREFIX = "vp-progress:";
@@ -749,7 +786,11 @@ function useResponsive() {
   return { isMobile };
 }
 
-export function App() {
+type AppProps = {
+  onGoHome?: () => void;
+};
+
+export function App({ onGoHome }: AppProps) {
   const pluginManagerRef = useRef<PluginManager>(new PluginManager());
   const completionAudioContextRef = useRef<AudioContext | null>(null);
   const completionAudioUnlockedRef = useRef(false);
@@ -767,8 +808,10 @@ export function App() {
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
   const loadingSessionRef = useRef<Record<string, Promise<SyncSessionResult>>>({});
+  const staleSessionKeysRef = useRef<Set<string>>(new Set());
   const invalidTreeCacheKeysRef = useRef<Set<string>>(new Set());
   const boundSessionByRootRef = useRef<Record<string, string | null>>({});
+  const suppressedAutoBindSessionByRootRef = useRef<Record<string, string | null>>({});
   const drawerSessionByRootRef = useRef<Record<string, SessionItem | null>>({});
   const selectedSessionByRootRef = useRef<Record<string, string | null>>({});
   const mainViewPreferenceByRootRef = useRef<
@@ -874,6 +917,12 @@ export function App() {
   const [relayStatus, setRelayStatus] = useState<RelayStatusPayload | null>(
     null,
   );
+  const [e2eeState, setE2eeState] = useState<E2EEState>(() =>
+    e2eeService.snapshot(),
+  );
+  const [e2eeSecretInput, setE2eeSecretInput] = useState("");
+  const [e2eePromptError, setE2eePromptError] = useState("");
+  const [e2eePromptBusy, setE2eePromptBusy] = useState(false);
   const [entriesByPath, setEntriesByPath] = useState<
     Record<string, FileEntry[]>
   >({});
@@ -1012,8 +1061,10 @@ export function App() {
     }
     setUpdateSubmitting(true);
     try {
+      await scheduleWebViewCacheClearOnNextLaunch();
       setUpdateState(normalizeUpdateState(await triggerUpdate()));
     } catch (error) {
+      await cancelScheduledWebViewCacheClear();
       const message =
         error instanceof Error ? error.message : "Failed to start update";
       setUpdateState((prev) =>
@@ -1414,6 +1465,139 @@ export function App() {
     [],
   );
 
+  const resolvePendingForSession = useCallback(
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+      fallback?: boolean,
+    ): boolean => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return !!fallback;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      if (pendingBySessionRef.current[cacheKey]) {
+        return true;
+      }
+      const drawer = drawerSessionByRootRef.current[resolvedRoot] as
+        | ({ pending?: boolean; key?: string; session_key?: string } & Record<string, unknown>)
+        | null
+        | undefined;
+      if (
+        drawer &&
+        (drawer.key || drawer.session_key) === resolvedKey &&
+        typeof drawer.pending === "boolean"
+      ) {
+        return drawer.pending;
+      }
+      const selected = selectedSessionRef.current as
+        | ({ pending?: boolean; key?: string; session_key?: string; root_id?: string } & Record<string, unknown>)
+        | null
+        | undefined;
+      if (
+        selected &&
+        ((selected.root_id as string | undefined) || currentRootIdRef.current) ===
+          resolvedRoot &&
+        (selected.key || selected.session_key) === resolvedKey &&
+        typeof selected.pending === "boolean"
+      ) {
+        return selected.pending;
+      }
+      const cached = sessionCacheRef.current[cacheKey] as
+        | ({ pending?: boolean } & Record<string, unknown>)
+        | null
+        | undefined;
+      if (cached && typeof cached.pending === "boolean") {
+        return cached.pending;
+      }
+      return !!fallback;
+    },
+    [rootSessionKey],
+  );
+
+  const markSessionStale = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return;
+      }
+      staleSessionKeysRef.current.add(rootSessionKey(resolvedRoot, resolvedKey));
+    },
+    [rootSessionKey],
+  );
+
+  const clearSessionStale = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return;
+      }
+      staleSessionKeysRef.current.delete(rootSessionKey(resolvedRoot, resolvedKey));
+    },
+    [rootSessionKey],
+  );
+
+  const isSessionStale = useCallback(
+    (rootID: string | null | undefined, sessionKey: string | null | undefined): boolean => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey) {
+        return false;
+      }
+      return staleSessionKeysRef.current.has(rootSessionKey(resolvedRoot, resolvedKey));
+    },
+    [rootSessionKey],
+  );
+
+  const restoreActiveSession = useCallback(
+    async (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+    ): Promise<Session | null> => {
+      const resolvedRoot = String(rootID || "");
+      const resolvedKey = String(sessionKey || "");
+      if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
+        return null;
+      }
+      const cacheKey = rootSessionKey(resolvedRoot, resolvedKey);
+      const inflight = loadingSessionRef.current[cacheKey];
+      const request =
+        inflight ||
+        syncSession(resolvedRoot, resolvedKey).finally(() => {
+          delete loadingSessionRef.current[cacheKey];
+        });
+      if (!inflight) {
+        loadingSessionRef.current[cacheKey] = request;
+      }
+      const syncResult = await request;
+      const fullSession = syncResult?.session;
+      if (!fullSession) {
+        return null;
+      }
+      const pending = resolvePendingForSession(
+        resolvedRoot,
+        resolvedKey,
+        !!(fullSession as any)?.pending,
+      );
+      sessionCacheRef.current[cacheKey] = {
+        ...(fullSession as any),
+        key: resolvedKey,
+        pending,
+      } as Session;
+      bumpCacheVersion();
+      await sessionService.markSessionReady(resolvedRoot, resolvedKey);
+      return {
+        ...(fullSession as any),
+        key: resolvedKey,
+        pending,
+      } as Session;
+    },
+    [bumpCacheVersion, resolvePendingForSession, rootSessionKey],
+  );
+
   const updateSessionRelatedFilesForKey = useCallback(
     (rootID: string, sessionKey: string, relatedFiles: RelatedFile[]) => {
       if (!rootID || !sessionKey) return;
@@ -1796,13 +1980,26 @@ export function App() {
         const merged = { ...(existing || {}), ...incoming };
         if (!incoming.kind && existing?.kind) merged.kind = existing.kind;
         if (!incoming.title && existing?.title) merged.title = existing.title;
+        const existingStatus = `${existing?.status || ""}`.toLowerCase();
+        const incomingStatus = `${incoming?.status || ""}`.toLowerCase();
+        if (
+          (existingStatus === "failed" ||
+            existingStatus === "error" ||
+            existingStatus === "complete" ||
+            existingStatus === "success") &&
+          (incomingStatus === "running" ||
+            incomingStatus === "pending" ||
+            incomingStatus === "in_progress")
+        ) {
+          merged.status = existing.status;
+        }
         return merged;
       };
       const updateList = (prevList: Exchange[]) => {
         const list = [...(prevList || [])];
         const callId =
           toolCall.callId || toolCall.toolCallId || toolCall.tool_call_id || "";
-        if (update && callId) {
+        if (callId) {
           for (let i = list.length - 1; i >= 0; i--) {
             if (
               list[i]?.role === "tool" &&
@@ -1845,6 +2042,111 @@ export function App() {
       bumpCacheVersion();
     },
     [rootSessionKey, bumpCacheVersion],
+  );
+
+  const appendTodoUpdateForSession = useCallback(
+    (rootID: string, sessionKey: string, todoUpdate: any) => {
+      if (!todoUpdate) return;
+      const now = new Date().toISOString();
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      const updateList = (prevList: Exchange[]) => {
+        const list = [...(prevList || [])];
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          if (list[i]?.role !== "todo") continue;
+          list[i] = {
+            ...list[i],
+            timestamp: now,
+            todoUpdate,
+          };
+          return list;
+        }
+        list.push({ role: "todo", content: "", timestamp: now, todoUpdate });
+        return list;
+      };
+      const cached = sessionCacheRef.current[cacheKey];
+      const base =
+        cached ||
+        ({
+          key: sessionKey,
+          type: "chat",
+          agent: "",
+          name: "",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          exchanges: [],
+        } as any);
+      const nextList = updateList(
+        ((base as any).exchanges || []) as Exchange[],
+      );
+      sessionCacheRef.current[cacheKey] = {
+        ...(base as any),
+        exchanges: nextList,
+        updated_at: new Date().toISOString(),
+      } as Session;
+      bumpCacheVersion();
+    },
+    [rootSessionKey, bumpCacheVersion],
+  );
+
+  const attachContextWindowToLatestAssistant = useCallback(
+    (
+      rootID: string,
+      sessionKey: string,
+      contextWindow?: { totalTokens?: number; modelContextWindow?: number },
+    ) => {
+      const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+      const modelContextWindow = Math.max(0, Number(contextWindow?.modelContextWindow || 0));
+      if (!totalTokens || !modelContextWindow) {
+        return;
+      }
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      const stampList = (prevList: Exchange[]) => {
+        const list = [...(prevList || [])];
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          const item = list[i];
+          if (item?.role === "agent" || item?.role === "assistant") {
+            list[i] = {
+              ...item,
+              context_window: {
+                totalTokens,
+                modelContextWindow,
+              },
+            };
+            break;
+          }
+        }
+        return list;
+      };
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached) {
+        const exchanges = stampList((((cached as any).exchanges || []) as Exchange[]));
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          exchanges,
+          updated_at: new Date().toISOString(),
+        } as Session;
+      }
+      setSelectedSession((prev) => {
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (!prev || prevRoot !== rootID || (prev.key || prev.session_key) !== sessionKey) {
+          return prev;
+        }
+        return {
+          ...(prev as any),
+          exchanges: stampList((((prev as any).exchanges || []) as Exchange[])),
+        } as SessionItem;
+      });
+      const drawer = drawerSessionByRootRef.current[rootID];
+      if (drawer && drawer.key === sessionKey) {
+        setDrawerSessionForRoot(rootID, {
+          ...(drawer as any),
+          exchanges: stampList((((drawer as any).exchanges || []) as Exchange[])),
+        } as Session);
+      }
+      bumpCacheVersion();
+    },
+    [bumpCacheVersion, rootSessionKey],
   );
 
   const normalizeTreeResponse = useCallback((payload: any) => {
@@ -1957,23 +2259,33 @@ export function App() {
 
   const refreshGitStatus = useCallback(async (rootID: string) => {
     if (!rootID) {
-      setGitStatus(null);
+      if (!currentRootIdRef.current) {
+        setGitStatus(null);
+        setGitStatusLoading(false);
+      }
       return null;
     }
+    const shouldApply = () => currentRootIdRef.current === rootID;
     if (managedRootByIdRef.current[rootID]?.is_git_repo !== true) {
       const fallback = {
         available: false,
         dirty_count: 0,
         items: [],
       } as GitStatusPayload;
-      setGitStatus(fallback);
-      setGitStatusLoading(false);
+      if (shouldApply()) {
+        setGitStatus(fallback);
+        setGitStatusLoading(false);
+      }
       return fallback;
     }
-    setGitStatusLoading(true);
+    if (shouldApply()) {
+      setGitStatusLoading(true);
+    }
     try {
       const next = await fetchGitStatus(rootID);
-      setGitStatus(next);
+      if (shouldApply()) {
+        setGitStatus(next);
+      }
       return next;
     } catch (err) {
       console.error("[git.status] failed", { rootID, err });
@@ -1982,10 +2294,14 @@ export function App() {
         dirty_count: 0,
         items: [],
       } as GitStatusPayload;
-      setGitStatus(fallback);
+      if (shouldApply()) {
+        setGitStatus(fallback);
+      }
       return fallback;
     } finally {
-      setGitStatusLoading(false);
+      if (shouldApply()) {
+        setGitStatusLoading(false);
+      }
     }
   }, []);
 
@@ -2178,6 +2494,12 @@ export function App() {
         pluginQuery: {},
       });
       selectedSessionByRootRef.current[targetRoot] = key;
+      const cacheKey = rootSessionKey(targetRoot, key);
+      const wasStale = isSessionStale(targetRoot, key);
+      const hadInMemoryState =
+        !!pendingBySessionRef.current[cacheKey] ||
+        hasSessionExchanges(sessionCacheRef.current[cacheKey]);
+      const shouldSyncHistory = wasStale || !hadInMemoryState;
       setSelectedSessionLoading(true);
       setSelectedSession(
         toSessionItem(targetRoot, {
@@ -2189,14 +2511,24 @@ export function App() {
       setDrawerOpenForRoot(targetRoot, false);
       if (isMobile) setIsRightOpen(false);
       await waitForNextPaint();
-      const cacheKey = rootSessionKey(targetRoot, key);
-      const applySession = (fullSession: Session) => {
+      const applySession = (
+        fullSession: Session,
+        options?: { writeCache?: boolean },
+      ) => {
+        const shouldWriteCache = options?.writeCache !== false;
+        const pending = resolvePendingForSession(
+          targetRoot,
+          key,
+          !!(fullSession as any)?.pending || preservePending,
+        );
         const normalized = {
           ...(fullSession as any),
           key,
-          pending: false,
+          pending,
         } as Session;
-        sessionCacheRef.current[cacheKey] = normalized;
+        if (shouldWriteCache) {
+          sessionCacheRef.current[cacheKey] = normalized;
+        }
         setSelectedSession((prev) => {
           const prevKey = prev?.key || prev?.session_key;
           const prevRoot =
@@ -2218,48 +2550,36 @@ export function App() {
           } as Session);
         }
         setSelectedSessionLoading(false);
-        bumpCacheVersion();
+        if (shouldWriteCache) {
+          bumpCacheVersion();
+        }
       };
       const cached = sessionCacheRef.current[cacheKey];
       if (cached) {
         applySession(cached);
-        if (hasSessionExchanges(cached)) {
+        if (!shouldSyncHistory && hasSessionExchanges(cached)) {
           loadedSessionRef.current[cacheKey] = true;
-          void sessionService.markSessionReady(targetRoot, key);
           return;
         }
       } else {
         const persisted = await getCachedSession(targetRoot, key);
         if (persisted) {
           applySession(persisted);
+          if (!shouldSyncHistory && hasSessionExchanges(persisted)) {
+            loadedSessionRef.current[cacheKey] = true;
+            return;
+          }
         }
       }
-      if (loadedSessionRef.current[cacheKey]) {
-        void sessionService.markSessionReady(targetRoot, key);
+      if (!shouldSyncHistory && loadedSessionRef.current[cacheKey]) {
         return;
       }
       try {
-        const inflight = loadingSessionRef.current[cacheKey];
-        if (inflight) {
-          const syncResult = await inflight;
-          const fullSession = syncResult?.session;
-          if (fullSession) {
-            applySession(fullSession);
-          } else {
-            setSelectedSessionLoading(false);
-          }
-          return;
-        }
-        const request = syncSession(targetRoot, key).finally(() => {
-          delete loadingSessionRef.current[cacheKey];
-        });
-        loadingSessionRef.current[cacheKey] = request;
-        const syncResult = await request;
-        const fullSession = syncResult.session;
-        if (fullSession) {
-          applySession(fullSession as Session);
+        const restored = await restoreActiveSession(targetRoot, key);
+        if (restored) {
+          applySession(restored, { writeCache: false });
           loadedSessionRef.current[cacheKey] = true;
-          void sessionService.markSessionReady(targetRoot, key);
+          clearSessionStale(targetRoot, key);
         } else {
           setSelectedSessionLoading(false);
         }
@@ -2271,6 +2591,10 @@ export function App() {
       isMobile,
       rootSessionKey,
       bumpCacheVersion,
+      clearSessionStale,
+      isSessionStale,
+      resolvePendingForSession,
+      restoreActiveSession,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
       setMainViewPreferenceForRoot,
@@ -2330,17 +2654,6 @@ export function App() {
           ...(initialSession as any),
           key: preferredKey,
         } as Session;
-      } else {
-        const syncResult = await syncSession(resolvedRoot, preferredKey);
-        if (syncResult.session) {
-          initialSession = {
-            ...(syncResult.session as any),
-            key: preferredKey,
-          } as Session;
-          sessionCacheRef.current[cacheKey] = initialSession as Session;
-          loadedSessionRef.current[cacheKey] = true;
-          bumpCacheVersion();
-        }
       }
       await handleSelectSession(
         initialSession
@@ -2387,6 +2700,7 @@ export function App() {
       delete loadingSessionRef.current[cacheKey];
       delete pendingBySessionRef.current[cacheKey];
       delete cancelRequestedBySessionRef.current[cacheKey];
+      staleSessionKeysRef.current.delete(cacheKey);
       void deleteCachedSession(rootID, sessionKey);
 
       if (boundSessionByRootRef.current[rootID] === sessionKey) {
@@ -2501,6 +2815,68 @@ export function App() {
       return true;
     },
     [bumpCacheVersion, rootSessionKey, setDrawerSessionForRoot],
+  );
+
+  const handleSyncSession = useCallback(
+    async (session: SessionItem) => {
+      const sessionKey = session?.key || session?.session_key;
+      const rootID =
+        (session?.root_id as string | undefined) || currentRootIdRef.current;
+      if (!rootID || !sessionKey || sessionKey.startsWith("pending-")) return;
+
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      try {
+        const result = await syncSession(rootID, sessionKey);
+        const synced = result.session;
+        if (!synced) {
+          reportError("session.sync_failed", "同步会话失败");
+          return;
+        }
+        const normalized = {
+          ...(synced as any),
+          key: sessionKey,
+        } as Session;
+        sessionCacheRef.current[cacheKey] = normalized;
+        loadedSessionRef.current[cacheKey] = true;
+        clearSessionStale(rootID, sessionKey);
+
+        const nextItem = toSessionItem(rootID, normalized);
+        if (nextItem) {
+          setSessions((prev) => mergeSessionItems(prev, [nextItem]));
+        }
+
+        setSelectedSession((prev) => {
+          const prevKey = prev?.key || prev?.session_key;
+          const prevRoot =
+            (prev?.root_id as string | undefined) || currentRootIdRef.current;
+          if (!prev || prevKey !== sessionKey || prevRoot !== rootID) {
+            return prev;
+          }
+          return toSessionItem(rootID, {
+            ...(prev as any),
+            ...(normalized as any),
+            key: sessionKey,
+            session_key: sessionKey,
+            root_id: rootID,
+          });
+        });
+
+        if (drawerSessionByRootRef.current[rootID]?.key === sessionKey) {
+          setDrawerSessionForRoot(rootID, normalized);
+        }
+
+        bumpCacheVersion();
+      } catch {
+        reportError("session.sync_failed", "同步会话失败");
+      }
+    },
+    [
+      bumpCacheVersion,
+      clearSessionStale,
+      mergeSessionItems,
+      rootSessionKey,
+      setDrawerSessionForRoot,
+    ],
   );
 
   useEffect(() => {
@@ -2664,15 +3040,18 @@ export function App() {
       }
       const selected = selectedSessionRef.current;
       const selectedKey = selected?.key || selected?.session_key;
+      const selectedRoot =
+        (selected?.root_id as string | undefined) || activeRoot;
+      const currentBoundSessionKey =
+        boundSessionByRootRef.current[activeRoot] || null;
       const isMainSessionView =
         interactionModeRef.current !== "drawer" &&
         !!selectedKey &&
-        (((selected as any)?.root_id as string | undefined) || activeRoot) ===
-          activeRoot;
+        selectedRoot === activeRoot;
       let sendSessionKey: string | null | undefined =
         isMainSessionView && selectedKey && !selectedKey.startsWith("pending-")
           ? selectedKey
-          : activeBoundSessionKey;
+          : currentBoundSessionKey;
       let session: Session | null = null;
       if (sendSessionKey) {
         session =
@@ -2687,7 +3066,11 @@ export function App() {
           session = { ...(selected as any), key: sendSessionKey } as Session;
         }
       } else {
-        if (selectedKey && !selectedKey.startsWith("pending-")) {
+        if (
+          selectedRoot === activeRoot &&
+          selectedKey &&
+          !selectedKey.startsWith("pending-")
+        ) {
           sendSessionKey = selectedKey;
           session =
             sessionCacheRef.current[
@@ -2881,7 +3264,6 @@ export function App() {
       }
     },
     [
-      activeBoundSessionKey,
       attachedFileContext,
       rootSessionKey,
       setSelectedPendingByKey,
@@ -2909,7 +3291,14 @@ export function App() {
 
   const handleNewSession = useCallback(() => {
     const rootID = currentRootIdRef.current;
+    const previousBoundKey = rootID ? boundSessionByRootRef.current[rootID] : "";
+    if (rootID && previousBoundKey && !previousBoundKey.startsWith("pending-")) {
+      suppressedAutoBindSessionByRootRef.current[rootID] = previousBoundKey;
+    }
     setMainViewPreferenceForRoot(rootID, "session");
+    selectedSessionRef.current = null;
+    currentSessionRef.current = null;
+    interactionModeRef.current = "main";
     setSelectedSession(null);
     if (rootID) {
       selectedSessionByRootRef.current[rootID] = null;
@@ -3090,6 +3479,8 @@ export function App() {
         if (currentRootIdRef.current !== root) {
           setCurrentRootId(root);
         }
+        setSelectedDir(String(root));
+        setSelectedDirKey(null);
         const requestedCursor = normalizeCursor(params.cursor);
         const cursor = requestedCursor === null ? 0 : requestedCursor;
         const preserveQuery = !!params.preservePluginQuery;
@@ -3253,7 +3644,8 @@ export function App() {
         fileOpenRequestRef.current += 1;
         const path = params.path,
           rootParam = params.root || currentRootIdRef.current,
-          isToggle = !!params.toggle;
+          isToggle = !!params.toggle,
+          forceDirectory = !!params.forceDirectory;
         if (!path || !rootParam) return;
         setGitDiff(null);
         const isActuallyRoot = params.isRoot === true;
@@ -3382,14 +3774,16 @@ export function App() {
         if (isActuallyRoot) {
           setCurrentRootId(path);
           setExpanded((prev) => Array.from(new Set([...prev, path])));
-          const restored = await tryShowBoundSessionForRoot(path, {
-            pluginQuery: nextPluginQuery,
-            closeLeftSidebar: true,
-          });
-          if (restored) {
-            void loadSessionsForRoot(path, { replace: true, force: true });
-            await refreshTreeDir(path, ".", false);
-            return;
+          if (!forceDirectory) {
+            const restored = await tryShowBoundSessionForRoot(path, {
+              pluginQuery: nextPluginQuery,
+              closeLeftSidebar: true,
+            });
+            if (restored) {
+              void loadSessionsForRoot(path, { replace: true, force: true });
+              await refreshTreeDir(path, ".", false);
+              return;
+            }
           }
         } else {
           setExpanded((prev) => Array.from(new Set([...prev, expandedKey])));
@@ -3486,11 +3880,8 @@ export function App() {
   }, [handleRelayNavigationFailure, replaceURLState]);
 
   const refreshRelayStatus = useCallback(async () => {
-    if (typeof window !== "undefined" && isRelayNodePage()) {
-      return;
-    }
     try {
-      const response = await fetch("/api/relay/status");
+      const response = await fetch(appPath("/api/relay/status"));
       if (!response.ok) {
         return;
       }
@@ -4219,46 +4610,28 @@ export function App() {
       sessionKey: string,
     ) => {
       if (!rootID || !sessionKey) return;
-      const cacheKey = rootSessionKey(rootID, sessionKey);
-      const inflight = loadingSessionRef.current[cacheKey];
-      const request =
-        inflight ||
-        syncSession(rootID, sessionKey).finally(() => {
-          delete loadingSessionRef.current[cacheKey];
-        });
-      if (!inflight) {
-        loadingSessionRef.current[cacheKey] = request;
-      }
-      const syncResult = await request;
+      const restored = await restoreActiveSession(rootID, sessionKey);
       if (cancelled) return;
-      if (syncResult?.session) {
-        const normalized = {
-          ...(syncResult.session as any),
-          key: sessionKey,
-          pending: false,
-        } as Session;
-        sessionCacheRef.current[cacheKey] = normalized;
-        loadedSessionRef.current[cacheKey] = true;
-        bumpCacheVersion();
-        if (
-          (selectedSessionRef.current?.key ||
-            selectedSessionRef.current?.session_key) === sessionKey
-        ) {
-          setSelectedSession((prev) =>
-            prev
-              ? toSessionItem(rootID, {
-                  ...(prev as any),
-                  ...(normalized as any),
-                  pending: false,
-                })
-              : prev,
-          );
-        }
-        if (boundSessionByRootRef.current[rootID] === sessionKey) {
-          setDrawerSessionForRoot(rootID, normalized);
-        }
+      if (!restored) return;
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      loadedSessionRef.current[cacheKey] = true;
+      clearSessionStale(rootID, sessionKey);
+      if (
+        (selectedSessionRef.current?.key ||
+          selectedSessionRef.current?.session_key) === sessionKey
+      ) {
+        setSelectedSession((prev) =>
+          prev
+            ? toSessionItem(rootID, {
+                ...(prev as any),
+                ...(restored as any),
+              })
+            : prev,
+        );
       }
-      await sessionService.markSessionReady(rootID, sessionKey);
+      if (boundSessionByRootRef.current[rootID] === sessionKey) {
+        setDrawerSessionForRoot(rootID, restored);
+      }
     };
     const getReplayTargetsForRoot = (rootID: string): string[] => {
       if (!rootID) return [];
@@ -4293,12 +4666,29 @@ export function App() {
       return Array.from(keys);
     };
     const replayTargetsForAllRoots = () => {
+      const replayCacheKeys = new Set<string>();
       for (const rootID of managedRootIdsRef.current) {
         if (!rootID) continue;
         const replayTargets = getReplayTargetsForRoot(rootID);
         for (const sessionKey of replayTargets) {
+          replayCacheKeys.add(rootSessionKey(rootID, sessionKey));
           void reloadSessionForReplay(rootID, sessionKey);
         }
+      }
+      for (const cacheKey of Object.keys(sessionCacheRef.current)) {
+        if (replayCacheKeys.has(cacheKey)) {
+          continue;
+        }
+        const separator = cacheKey.indexOf("::");
+        if (separator <= 0) {
+          continue;
+        }
+        const rootID = cacheKey.slice(0, separator);
+        const sessionKey = cacheKey.slice(separator + 2);
+        if (!rootID || !sessionKey || !hasSessionExchanges(sessionCacheRef.current[cacheKey])) {
+          continue;
+        }
+        markSessionStale(rootID, sessionKey);
       }
     };
     const refreshSessionRelatedFiles = async (
@@ -4330,9 +4720,15 @@ export function App() {
       }
       setSelectedPendingByKey(sessionKey, false);
       setSelectedSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
         const prevRoot =
           (prev?.root_id as string | undefined) || currentRootIdRef.current;
-        if (!prev || prevRoot !== rootID || !(prev as any).pending) {
+        if (
+          !prev ||
+          prevKey !== sessionKey ||
+          prevRoot !== rootID ||
+          !(prev as any).pending
+        ) {
           return prev;
         }
         return {
@@ -4340,17 +4736,13 @@ export function App() {
           pending: false,
         } as SessionItem;
       });
-      const latest = wasCanceled
-        ? sessionCacheRef.current[cacheKey]
-        : drawerSessionByRootRef.current[rootID];
-      if (latest && latest.key === sessionKey) {
+      const drawer = drawerSessionByRootRef.current[rootID];
+      if (drawer && drawer.key === sessionKey) {
+        const latest = wasCanceled
+          ? sessionCacheRef.current[cacheKey] || drawer
+          : drawer;
         setDrawerSessionForRoot(rootID, {
           ...(latest as any),
-          pending: false,
-        } as Session);
-      } else if (drawerSessionByRootRef.current[rootID] && (drawerSessionByRootRef.current[rootID] as any)?.pending) {
-        setDrawerSessionForRoot(rootID, {
-          ...(drawerSessionByRootRef.current[rootID] as any),
           pending: false,
         } as Session);
       }
@@ -4369,7 +4761,12 @@ export function App() {
       let pending = pendingBySessionRef.current[ck];
       if (!pending) {
         const draft = pendingDraftRef.current;
-        if (draft && draft.rootId === activeRoot) {
+        if (
+          draft &&
+          draft.rootId === activeRoot &&
+          streamKey !==
+            (suppressedAutoBindSessionByRootRef.current[activeRoot] || "")
+        ) {
           pending = draft;
           pendingBySessionRef.current[ck] = draft;
           pendingDraftRef.current = null;
@@ -4377,10 +4774,16 @@ export function App() {
         }
       }
       const boundKey = boundSessionByRootRef.current[activeRoot] || "";
+      const suppressedAutoBindKey =
+        suppressedAutoBindSessionByRootRef.current[activeRoot] || "";
       if (
-        !boundKey ||
-        (typeof boundKey === "string" && boundKey.startsWith("pending-"))
+        streamKey !== suppressedAutoBindKey &&
+        (!boundKey ||
+          (typeof boundKey === "string" && boundKey.startsWith("pending-")))
       ) {
+        if (suppressedAutoBindKey && streamKey !== suppressedAutoBindKey) {
+          suppressedAutoBindSessionByRootRef.current[activeRoot] = null;
+        }
         setBoundSessionForRoot(activeRoot, streamKey);
         if (pending) {
           const pendingName =
@@ -4449,6 +4852,22 @@ export function App() {
       }
       const event = payload.event;
       if (!event?.type) return;
+      const updateDrawerIfShowingStream = () => {
+        const drawerKey = drawerSessionByRootRef.current[activeRoot]?.key || "";
+        if (
+          drawerKey !== streamKey &&
+          (!pending?.tempKey || drawerKey !== pending.tempKey)
+        ) {
+          return;
+        }
+        const latest = sessionCacheRef.current[ck];
+        if (latest) {
+          setDrawerSessionForRoot(activeRoot, {
+            ...(latest as any),
+            pending: true,
+          } as Session);
+        }
+      };
       switch (event.type) {
         case "message_chunk":
           appendAgentChunkForSession(
@@ -4457,15 +4876,7 @@ export function App() {
             event.data?.content || "",
             pending?.agent,
           );
-          {
-            const latest = sessionCacheRef.current[ck];
-            if (latest) {
-              setDrawerSessionForRoot(activeRoot, {
-                ...(latest as any),
-                pending: true,
-              } as Session);
-            }
-          }
+          updateDrawerIfShowingStream();
           break;
         case "thought_chunk":
           appendThoughtChunkForSession(
@@ -4473,15 +4884,7 @@ export function App() {
             streamKey,
             event.data?.content || "",
           );
-          {
-            const latest = sessionCacheRef.current[ck];
-            if (latest) {
-              setDrawerSessionForRoot(activeRoot, {
-                ...(latest as any),
-                pending: true,
-              } as Session);
-            }
-          }
+          updateDrawerIfShowingStream();
           break;
         case "tool_call":
           appendToolCallForSession(
@@ -4490,15 +4893,7 @@ export function App() {
             event.data || {},
             false,
           );
-          {
-            const latest = sessionCacheRef.current[ck];
-            if (latest) {
-              setDrawerSessionForRoot(activeRoot, {
-                ...(latest as any),
-                pending: true,
-              } as Session);
-            }
-          }
+          updateDrawerIfShowingStream();
           break;
         case "tool_call_update":
           appendToolCallForSession(
@@ -4507,17 +4902,22 @@ export function App() {
             event.data || {},
             true,
           );
-          {
-            const latest = sessionCacheRef.current[ck];
-            if (latest) {
-              setDrawerSessionForRoot(activeRoot, {
-                ...(latest as any),
-                pending: true,
-              } as Session);
-            }
-          }
+          updateDrawerIfShowingStream();
+          break;
+        case "todo_update":
+          appendTodoUpdateForSession(
+            activeRoot,
+            streamKey,
+            event.data || {},
+          );
+          updateDrawerIfShowingStream();
           break;
         case "message_done":
+          attachContextWindowToLatestAssistant(
+            activeRoot,
+            streamKey,
+            event.data?.contextWindow,
+          );
           playCompletionSound();
           handleSessionStreamDone(activeRoot, streamKey);
           break;
@@ -4709,6 +5109,24 @@ export function App() {
           }
           console.info("[session/ws] accepted", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
           delete pendingRequestRef.current[requestId];
+          const acceptedSessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          if (!pending.sessionKey && pending.tempKey && acceptedSessionKey) {
+            const cacheKey = rootSessionKey(pending.rootId, acceptedSessionKey);
+            pendingBySessionRef.current[cacheKey] = {
+              ...pending,
+              sessionKey: acceptedSessionKey,
+            };
+            if (pendingDraftRef.current?.requestId === pending.requestId) {
+              pendingDraftRef.current = null;
+            }
+            promotePendingSessionForRoot(
+              pending.rootId,
+              pending.tempKey,
+              acceptedSessionKey,
+              sessionCacheRef.current[cacheKey] || null,
+            );
+          }
           const markAccepted = (
             sess: Session | null | undefined,
           ): Session | null => {
@@ -4724,8 +5142,9 @@ export function App() {
               : [];
             return { ...(sess as any), exchanges } as Session;
           };
-          if (pending.sessionKey) {
-            const cacheKey = rootSessionKey(pending.rootId, pending.sessionKey);
+          const acceptedTargetKey = pending.sessionKey || acceptedSessionKey;
+          if (acceptedTargetKey) {
+            const cacheKey = rootSessionKey(pending.rootId, acceptedTargetKey);
             const accepted = markAccepted(sessionCacheRef.current[cacheKey]);
             if (accepted) {
               sessionCacheRef.current[cacheKey] = accepted;
@@ -4736,7 +5155,9 @@ export function App() {
           const drawerKey = latestDrawer?.key || "";
           if (
             drawerKey &&
-            (drawerKey === pending.sessionKey || drawerKey === pending.tempKey)
+            (drawerKey === pending.sessionKey ||
+              drawerKey === pending.tempKey ||
+              drawerKey === acceptedSessionKey)
           ) {
             const accepted = markAccepted(latestDrawer);
             if (accepted) {
@@ -5049,6 +5470,10 @@ export function App() {
     appendAgentChunkForSession,
     appendThoughtChunkForSession,
     appendToolCallForSession,
+    appendTodoUpdateForSession,
+    clearSessionStale,
+    markSessionStale,
+    resolvePendingForSession,
     setSelectedPendingByKey,
     setBoundSessionForRoot,
     setDrawerSessionForRoot,
@@ -5207,6 +5632,69 @@ export function App() {
     refreshTreeDir,
     tryShowBoundSessionForRoot,
   ]);
+
+  useEffect(() => {
+    return e2eeService.subscribe((state) => {
+      setE2eeState(state);
+    });
+  }, []);
+
+  useEffect(() => {
+    const nodeId = String(relayStatus?.e2ee_node_id || relayStatus?.node_id || "").trim();
+    const required = relayStatus?.e2ee_required === true;
+    e2eeService.configure(required, nodeId);
+  }, [relayStatus?.e2ee_required, relayStatus?.e2ee_node_id, relayStatus?.node_id]);
+
+  useEffect(() => {
+    if (!e2eeState.required) {
+      setE2eeSecretInput("");
+      setE2eePromptError("");
+    }
+  }, [e2eeState.required, e2eeState.secretPresent]);
+
+  const describeE2EEPromptError = useCallback((err: unknown) => {
+    const code = err instanceof Error ? String(err.message || "").trim() : "";
+    switch (code) {
+      case "e2ee_proof_invalid":
+        return "端到端配对码无效，或当前节点标识已变化";
+      case "e2ee_secure_context_required":
+      case "e2ee_webcrypto_unavailable":
+        return "当前连接不是安全上下文，局域网配对请改用 HTTPS 或 localhost";
+      case "e2ee_secret_missing":
+        return "配对初始化失败，请刷新页面后重试";
+      case "e2ee_open_invalid_response":
+        return "握手响应无效，请稍后重试";
+      default:
+        if (code.startsWith("e2ee_open_failed_")) {
+          return "握手请求失败，请检查当前节点连接状态";
+        }
+        return "端到端握手失败，请重试";
+    }
+  }, []);
+
+  const submitE2EESecret = useCallback(async () => {
+    const trimmed = e2eeSecretInput.trim();
+    if (!trimmed) {
+      setE2eePromptError("请输入端到端配对码");
+      return;
+    }
+    setE2eePromptBusy(true);
+    setE2eePromptError("");
+    try {
+      e2eeService.setSecret(trimmed);
+      await e2eeService.ensureSession();
+      setE2eeSecretInput("");
+    } catch (err) {
+      if (err instanceof Error && err.message === "e2ee_proof_invalid") {
+        e2eeService.clearSecret();
+      } else {
+        e2eeService.clearSession();
+      }
+      setE2eePromptError(describeE2EEPromptError(err));
+    } finally {
+      setE2eePromptBusy(false);
+    }
+  }, [describeE2EEPromptError, e2eeSecretInput]);
 
   useEffect(() => {
     if (!isRelayPWAContext()) {
@@ -5416,56 +5904,45 @@ export function App() {
       return;
     }
     const cacheKey = rootSessionKey(rootID, sessionKey);
+    const isStale = isSessionStale(rootID, sessionKey);
     const cached = sessionCacheRef.current[cacheKey];
-    if (loadedSessionRef.current[cacheKey]) {
+    if (!isStale && loadedSessionRef.current[cacheKey]) {
       return;
     }
-    if (hasSessionExchanges(cached)) {
+    if (!isStale && hasSessionExchanges(cached)) {
       return;
     }
-    if (hasSessionExchanges(selectedSessionSnapshot as Session | null)) {
+    if (!isStale && hasSessionExchanges(selectedSessionSnapshot as Session | null)) {
       return;
     }
     if (loadingSessionRef.current[cacheKey]) {
       return;
     }
-    const request = syncSession(rootID, sessionKey)
-      .then((syncResult) => {
-        const fullSession = syncResult?.session;
-        if (!fullSession) {
-          return;
+    void restoreActiveSession(rootID, sessionKey).then((restored) => {
+      if (!restored) {
+        return;
+      }
+      loadedSessionRef.current[cacheKey] = true;
+      clearSessionStale(rootID, sessionKey);
+      setSelectedSession((prev) => {
+        const prevKey = prev?.key || prev?.session_key;
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (!prev || prevKey !== sessionKey || prevRoot !== rootID) {
+          return prev;
         }
-        const normalized = {
-          ...(fullSession as any),
+        return toSessionItem(rootID, {
+          ...(prev as any),
+          ...(restored as any),
           key: sessionKey,
-        } as Session;
-        sessionCacheRef.current[cacheKey] = normalized;
-        loadedSessionRef.current[cacheKey] = true;
-        setSelectedSession((prev) => {
-          const prevKey = prev?.key || prev?.session_key;
-          const prevRoot =
-            (prev?.root_id as string | undefined) || currentRootIdRef.current;
-          if (!prev || prevKey !== sessionKey || prevRoot !== rootID) {
-            return prev;
-          }
-          return toSessionItem(rootID, {
-            ...(prev as any),
-            ...(normalized as any),
-            key: sessionKey,
-            session_key: sessionKey,
-            root_id: rootID,
-          });
+          session_key: sessionKey,
+          root_id: rootID,
         });
-        if (boundSessionByRootRef.current[rootID] === sessionKey) {
-          setDrawerSessionForRoot(rootID, normalized);
-        }
-        bumpCacheVersion();
-        void sessionService.markSessionReady(rootID, sessionKey);
-      })
-      .finally(() => {
-        delete loadingSessionRef.current[cacheKey];
       });
-    loadingSessionRef.current[cacheKey] = request;
+      if (boundSessionByRootRef.current[rootID] === sessionKey) {
+        setDrawerSessionForRoot(rootID, restored);
+      }
+    });
   }, [
     selectedSession,
     selectedSessionLoading,
@@ -5473,6 +5950,10 @@ export function App() {
     currentRootId,
     rootSessionKey,
     bumpCacheVersion,
+    clearSessionStale,
+    isSessionStale,
+    resolvePendingForSession,
+    restoreActiveSession,
     setDrawerSessionForRoot,
   ]);
 
@@ -5575,6 +6056,25 @@ export function App() {
     [updateSessionRelatedFilesForKey],
   );
 
+  const handleAskUserAnswer = useCallback(
+    async (input: {
+      rootId: string;
+      sessionKey: string;
+      agent?: string;
+      toolUseId: string;
+      answers: Record<string, string>;
+    }) => {
+      await sessionService.answerQuestion(
+        input.rootId,
+        input.sessionKey,
+        input.agent,
+        input.toolUseId,
+        input.answers,
+      );
+    },
+    [],
+  );
+
   const currentFileScrollKey = buildFileScrollKey(
     file?.root || currentRootId,
     file?.path,
@@ -5592,6 +6092,14 @@ export function App() {
       }
       gitFileStatsByPath={gitFileStatsByPath}
       onFileClick={handleSelectedSessionFileClick}
+      onRootClick={(root) => {
+        void actionHandlers.open_dir({
+          path: root,
+          root,
+          isRoot: true,
+          forceDirectory: true,
+        });
+      }}
       onRemoveRelatedFile={(path) =>
         void handleRemoveSessionRelatedFile(
           selectedSession?.root_id || currentRootId,
@@ -5599,6 +6107,7 @@ export function App() {
           path,
         )
       }
+      onAskUserAnswer={handleAskUserAnswer}
     />
   );
 
@@ -5640,6 +6149,7 @@ export function App() {
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
+              background: "var(--mindfs-topbar-bg, transparent)",
               fontSize: 12,
               color: "var(--text-secondary)",
             }}
@@ -6218,6 +6728,7 @@ export function App() {
           handleSelectSession(s);
           if (isMobile) setIsRightOpen(false);
         }}
+        onSync={handleSyncSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
         onLoadOlder={
@@ -6292,6 +6803,7 @@ export function App() {
             onUpdateAction={() => {
               void handleStartUpdate();
             }}
+            onGoHome={onGoHome}
           />
         }
         rightSidebar={sessionSidebar}
@@ -6449,6 +6961,14 @@ export function App() {
                 interactionMode="drawer"
                 gitFileStatsByPath={gitFileStatsByPath}
                 onFileClick={handleDrawerSessionFileClick}
+                onRootClick={(root) => {
+                  void actionHandlers.open_dir({
+                    path: root,
+                    root,
+                    isRoot: true,
+                    forceDirectory: true,
+                  });
+                }}
                 onRemoveRelatedFile={(path) =>
                   void handleRemoveSessionRelatedFile(
                     currentRootId,
@@ -6456,6 +6976,7 @@ export function App() {
                     path,
                   )
                 }
+                onAskUserAnswer={handleAskUserAnswer}
               />
             ) : (
               <div style={{ padding: "40px", textAlign: "center" }}>
@@ -6465,6 +6986,102 @@ export function App() {
           </BottomSheet>
         }
       />
+      {e2eeState.required && !e2eeState.secretPresent ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(15, 23, 42, 0.46)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "24px",
+            zIndex: 2000,
+          }}
+        >
+          <div
+            style={{
+              width: "min(460px, 100%)",
+              background: "#fff",
+              borderRadius: "20px",
+              padding: "24px",
+              boxShadow: "0 28px 80px rgba(15, 23, 42, 0.22)",
+              display: "flex",
+              flexDirection: "column",
+              gap: "14px",
+            }}
+	          >
+	            <div style={{ fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
+	              端到端配对码
+	            </div>
+	            <input
+	              type="text"
+              value={e2eeSecretInput}
+              onChange={(event) => {
+                setE2eeSecretInput(event.target.value);
+                if (e2eePromptError) {
+                  setE2eePromptError("");
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !e2eePromptBusy) {
+                  void submitE2EESecret();
+                }
+              }}
+	              placeholder="输入终端中显示的端到端配对码"
+              autoFocus
+              spellCheck={false}
+              style={{
+                width: "100%",
+                borderRadius: "14px",
+                border: "1px solid rgba(148, 163, 184, 0.4)",
+                padding: "14px 16px",
+                fontSize: "14px",
+                outline: "none",
+              }}
+            />
+            {e2eePromptError ? (
+              <div style={{ color: "#dc2626", fontSize: "13px" }}>
+                {e2eePromptError}
+              </div>
+            ) : null}
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setE2eeSecretInput("");
+                  setE2eePromptError("");
+                }}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: "#64748b",
+                  padding: 0,
+                  cursor: "pointer",
+                }}
+              >
+                清空
+              </button>
+              <button
+                type="button"
+                onClick={() => void submitE2EESecret()}
+                disabled={e2eePromptBusy}
+                style={{
+                  border: "none",
+                  borderRadius: "999px",
+                  background: e2eePromptBusy ? "#94a3b8" : "#0f172a",
+                  color: "#fff",
+                  padding: "10px 18px",
+                  cursor: e2eePromptBusy ? "not-allowed" : "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                {e2eePromptBusy ? "验证中..." : "继续"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <ToastContainer />
     </>
   );

@@ -3,6 +3,8 @@ package session
 import (
 	"strings"
 	"time"
+
+	agenttypes "mindfs/server/internal/agent/types"
 )
 
 const (
@@ -32,6 +34,45 @@ type Exchange struct {
 	Effort    string    `json:"effort,omitempty"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+type ExchangeAux struct {
+	Seq      int                  `json:"seq"`
+	Line     int                  `json:"line"`
+	ToolCall *agenttypes.ToolCall `json:"toolcall,omitempty"`
+	Thought  string               `json:"thought,omitempty"`
+}
+
+func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
+	if aux.ToolCall == nil {
+		return ExchangeAux{}, false
+	}
+
+	toolCall := CompactToolCall(*aux.ToolCall)
+	aux.ToolCall = &toolCall
+	aux.Thought = ""
+	return aux, true
+}
+
+func CompactToolCall(toolCall agenttypes.ToolCall) agenttypes.ToolCall {
+	if !PreserveToolCallContent(toolCall.Kind) {
+		toolCall.Content = nil
+	}
+	return toolCall
+}
+
+func PreserveToolCallContent(kind agenttypes.ToolKind) bool {
+	switch kind {
+	case agenttypes.ToolKindEdit,
+		agenttypes.ToolKindDelete,
+		agenttypes.ToolKindMove,
+		agenttypes.ToolKindAskUser,
+		agenttypes.ToolKindTodo,
+		agenttypes.ToolKindTask:
+		return true
+	default:
+		return false
+	}
 }
 
 type RelatedFile struct {

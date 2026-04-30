@@ -120,6 +120,58 @@ func (s *Service) GetSession(ctx context.Context, in GetSessionInput) (*session.
 	return manager.Get(ctx, in.Key, in.Seq)
 }
 
+type GetSessionExchangeAuxInput struct {
+	RootID string
+	Key    string
+	Seq    int
+}
+
+func (s *Service) GetSessionExchangeAux(ctx context.Context, in GetSessionExchangeAuxInput) (map[int][]session.ExchangeAux, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return nil, err
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return nil, err
+	}
+	return manager.GetExchangeAux(ctx, in.Key, in.Seq)
+}
+
+type GetSessionContextWindowInput struct {
+	RootID string
+	Key    string
+}
+
+func (s *Service) GetSessionContextWindow(ctx context.Context, in GetSessionContextWindowInput) (agenttypes.ContextWindow, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return agenttypes.ContextWindow{}, err
+	}
+	if strings.TrimSpace(in.Key) == "" {
+		return agenttypes.ContextWindow{}, errors.New("session key required")
+	}
+	manager, err := s.Registry.GetSessionManager(in.RootID)
+	if err != nil {
+		return agenttypes.ContextWindow{}, err
+	}
+	current, err := manager.Get(ctx, in.Key, 0)
+	if err != nil {
+		return agenttypes.ContextWindow{}, err
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return agenttypes.ContextWindow{}, nil
+	}
+	agentName := strings.TrimSpace(session.InferAgentFromSession(current))
+	if agentName == "" {
+		return agenttypes.ContextWindow{}, nil
+	}
+	sess, ok := pool.Get(agentPoolSessionKey(in.Key, agentName))
+	if !ok || sess == nil {
+		return agenttypes.ContextWindow{}, nil
+	}
+	return sess.ContextWindow(ctx)
+}
+
 type GetSessionRelatedFilesInput struct {
 	RootID string
 	Key    string
@@ -283,6 +335,14 @@ type SendMessageInput struct {
 	OnUpdate  func(agenttypes.Event)
 }
 
+type AnswerQuestionInput struct {
+	RootID     string
+	SessionKey string
+	Agent      string
+	ToolUseID  string
+	Answers    map[string]string
+}
+
 type CancelSessionTurnInput struct {
 	RootID string
 	Key    string
@@ -292,6 +352,8 @@ const (
 	switchContextTailLines   = 20
 	sessionNameTimeout       = 30 * time.Second
 	sessionNameMinMessageLen = 12
+	sessionRecoveryAttempts  = 3
+	sessionRecoveryDelay     = 30 * time.Second
 )
 
 type SuggestSessionNameInput struct {
@@ -789,7 +851,7 @@ func (s *Service) ensureAgentSession(
 	rootAbs string,
 ) (agenttypes.Session, *int, error) {
 	poolSessionKey := agentPoolSessionKey(current.Key, agentName)
-	nextModel := resolveRuntimeModel(current, model)
+	nextModel := resolveRuntimeModel(current, nil, model)
 	nextMode := resolveRuntimeMode(current, mode)
 	nextEffort := resolveRuntimeEffort(agentName, current, effort)
 	currentModel := ""
@@ -926,9 +988,14 @@ func shouldReopenSessionForEffort(pool *agent.Pool, agentName, currentEffort, ne
 	return protocol == agent.ProtocolCodexSDK || protocol == agent.ProtocolClaudeSDK
 }
 
-func resolveRuntimeModel(current *session.Session, requested string) string {
+func resolveRuntimeModel(current *session.Session, runtime agenttypes.Session, requested string) string {
 	if model := strings.TrimSpace(requested); model != "" {
 		return model
+	}
+	if runtime != nil {
+		if model := strings.TrimSpace(runtime.CurrentModel()); model != "" {
+			return model
+		}
 	}
 	if model := resolveSessionExchangeModel(current); model != "" {
 		return model
@@ -993,7 +1060,6 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
 	}
-	log.Printf("[session] turn.begin root=%s session=%s agent=%s model=%q", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model))
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	registerActiveTurn(in.RootID, in.Key, turnCancel)
 	defer unregisterActiveTurn(in.RootID, in.Key)
@@ -1039,54 +1105,137 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		IsInitial:     isInitial,
 	})
 	var responseText string
+	sawAssistantChunk := false
+	plannedAssistantSeq := len(current.Exchanges) + 2
+	auxBuffer := make([]session.ExchangeAux, 0, 8)
+	var thoughtBuffer strings.Builder
+	flushThought := func() {
+		thought := thoughtBuffer.String()
+		if strings.TrimSpace(thought) == "" {
+			thoughtBuffer.Reset()
+			return
+		}
+		thoughtBuffer.Reset()
+		auxBuffer = append(auxBuffer, session.ExchangeAux{
+			Seq:     plannedAssistantSeq,
+			Line:    currentAssistantLine(responseText),
+			Thought: thought,
+		})
+	}
 	lastResponseUpdateType := ""
-	sess.OnUpdate(func(update agenttypes.Event) {
-		update = normalizeAgentUpdatePaths(root, update)
-		if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
-			if toolCall, ok := update.Data.(agenttypes.ToolCall); ok && toolCall.IsWriteOperation() {
-				for _, path := range toolCall.GetAffectedPaths() {
-					if watcher == nil {
-						continue
-					}
-					if update.Type == agenttypes.EventTypeToolCall && toolCall.Status == "running" {
-						watcher.RecordPendingWrite(current.Key, path)
-					}
-					if update.Type == agenttypes.EventTypeToolUpdate || toolCall.Status == "complete" {
-						watcher.RecordSessionFile(current.Key, path)
+	attachSessionUpdates := func(runtime agenttypes.Session) {
+		runtime.OnUpdate(func(update agenttypes.Event) {
+			update = normalizeAgentUpdatePaths(root, update)
+			update = compactAgentUpdate(update)
+			switch update.Type {
+			case agenttypes.EventTypeThoughtChunk:
+				if chunk, ok := update.Data.(agenttypes.ThoughtChunk); ok && chunk.Content != "" {
+					thoughtBuffer.WriteString(chunk.Content)
+				}
+			case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
+				flushThought()
+			}
+			if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
+				if toolCall, ok := update.Data.(agenttypes.ToolCall); ok && toolCall.IsWriteOperation() {
+					for _, path := range toolCall.GetAffectedPaths() {
+						if watcher == nil {
+							continue
+						}
+						if update.Type == agenttypes.EventTypeToolCall && toolCall.Status == "running" {
+							watcher.RecordPendingWrite(current.Key, path)
+						}
+						if update.Type == agenttypes.EventTypeToolUpdate || toolCall.Status == "complete" {
+							watcher.RecordSessionFile(current.Key, path)
+						}
 					}
 				}
+				if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
+					toolCallCopy := toolCall
+					auxBuffer = append(auxBuffer, session.ExchangeAux{
+						Seq:      plannedAssistantSeq,
+						Line:     currentAssistantLine(responseText),
+						ToolCall: &toolCallCopy,
+					})
+				}
 			}
-		}
-		if update.Type == agenttypes.EventTypeMessageChunk {
-			if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
-				responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
+			if update.Type == agenttypes.EventTypeMessageChunk {
+				if chunk, ok := update.Data.(agenttypes.MessageChunk); ok {
+					sawAssistantChunk = true
+					responseText = appendResponseChunk(responseText, lastResponseUpdateType, chunk.Content)
+					lastResponseUpdateType = string(update.Type)
+				}
+			} else if update.Type == agenttypes.EventTypeThoughtChunk ||
+				update.Type == agenttypes.EventTypeToolCall ||
+				update.Type == agenttypes.EventTypeToolUpdate ||
+				update.Type == agenttypes.EventTypeTodoUpdate {
 				lastResponseUpdateType = string(update.Type)
 			}
-		} else if update.Type == agenttypes.EventTypeThoughtChunk ||
-			update.Type == agenttypes.EventTypeToolCall ||
-			update.Type == agenttypes.EventTypeToolUpdate {
-			lastResponseUpdateType = string(update.Type)
-		}
-		if watcher != nil {
-			watcher.MarkSessionActive(current.Key)
-		}
+			if watcher != nil {
+				watcher.MarkSessionActive(current.Key)
+			}
+			if in.OnUpdate != nil {
+				in.OnUpdate(update)
+			}
+		})
+	}
+	sendWithAttachedUpdates := func(runtime agenttypes.Session, content string) error {
+		attachSessionUpdates(runtime)
+		return runtime.SendMessage(turnCtx, content)
+	}
+	sendErr := sendWithAttachedUpdates(sess, prompt)
+	if sendErr != nil && !isCanceledTurnError(sendErr) {
+		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 		if in.OnUpdate != nil {
-			in.OnUpdate(update)
+			in.OnUpdate(agenttypes.Event{
+				Type: agenttypes.EventTypeRecovery,
+				Data: agenttypes.RecoveryStatus{Message: "遇到错误，重试中..."},
+			})
 		}
-	})
-	sendErr := sess.SendMessage(turnCtx, prompt)
+		if !sawAssistantChunk {
+			responseText = ""
+			lastResponseUpdateType = ""
+			auxBuffer = auxBuffer[:0]
+			thoughtBuffer.Reset()
+		}
+		recoveredSess, recoveredErr := s.recoverAgentTurn(turnCtx, SendRecoveryInput{
+			RootID:             in.RootID,
+			SessionKey:         current.Key,
+			Manager:            manager,
+			Current:            current,
+			AgentName:          in.Agent,
+			Model:              in.Model,
+			Mode:               in.Mode,
+			Effort:             in.Effort,
+			RootAbs:            rootAbs,
+			CurrentSession:     sess,
+			Prompt:             prompt,
+			SawAssistantChunk:  sawAssistantChunk,
+			SendWithAttachment: sendWithAttachedUpdates,
+		})
+		if recoveredErr != nil {
+			sendErr = recoveredErr
+		} else {
+			sess = recoveredSess
+			sendErr = nil
+		}
+	}
+	flushThought()
 	if sendErr != nil {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
-	persistedModel := strings.TrimSpace(in.Model)
-	if persistedModel == "" {
-		persistedModel = sess.CurrentModel()
+	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
+	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
+	if prefs := s.Registry.GetPreferences(); prefs != nil {
+		if changed, err := prefs.UpdateAgentDefaultsIfChanged(in.Agent, resolvedModel, resolvedEffort); err != nil {
+			log.Printf("[preferences] agent_defaults.update.error agent=%s err=%v", strings.TrimSpace(in.Agent), err)
+		} else if changed {
+			log.Printf("[preferences] agent_defaults.update.done agent=%s model=%q effort=%q", strings.TrimSpace(in.Agent), resolvedModel, resolvedEffort)
+		}
 	}
-	if err := manager.UpdateModel(ctx, current, persistedModel); err != nil {
+	if err := manager.UpdateModel(ctx, current, resolvedModel); err != nil {
 		return err
 	}
 	resolvedMode := resolveRuntimeMode(current, in.Mode)
-	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
 	if err := manager.AddExchangeForAgent(ctx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort); err != nil {
 		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
@@ -1094,6 +1243,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err := manager.AddExchangeForAgent(ctx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort); err != nil {
 		log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
+	}
+	for _, aux := range dedupeExchangeAuxBuffer(auxBuffer) {
+		if err := manager.AddExchangeAux(ctx, current.Key, aux); err != nil {
+			return err
+		}
 	}
 	if err := manager.UpdateAgentState(ctx, current, in.Agent, contextLineCount(current.Exchanges), sess.SessionID()); err != nil {
 		return err
@@ -1108,20 +1262,166 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	} else if prober != nil {
 		prober.ReportSuccess(in.Agent)
 	}
-	if isCanceledTurnError(sendErr) {
-		log.Printf("[session] turn.canceled root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
-	} else {
-		log.Printf("[session] turn.complete root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
+	return nil
+}
+
+type SendRecoveryInput struct {
+	RootID             string
+	SessionKey         string
+	Manager            *session.Manager
+	Current            *session.Session
+	AgentName          string
+	Model              string
+	Mode               string
+	Effort             string
+	RootAbs            string
+	CurrentSession     agenttypes.Session
+	Prompt             string
+	SawAssistantChunk  bool
+	SendWithAttachment func(agenttypes.Session, string) error
+}
+
+func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (agenttypes.Session, error) {
+	if s == nil {
+		return nil, errors.New("services not configured")
+	}
+	if in.Current == nil {
+		return nil, errors.New("session required")
+	}
+	if in.Manager == nil {
+		return nil, errors.New("session manager required")
+	}
+	if in.SendWithAttachment == nil {
+		return nil, errors.New("send function required")
+	}
+	if in.CurrentSession == nil {
+		return nil, errors.New("current session required")
 	}
 
-	return nil
+	var lastErr error
+	for attempt := 1; attempt <= sessionRecoveryAttempts; attempt++ {
+		if attempt > 1 {
+			log.Printf("[session/recovery] wait root=%s session=%s agent=%s attempt=%d/%d delay=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, sessionRecoveryDelay)
+			if err := waitForRecoveryDelay(ctx, sessionRecoveryDelay); err != nil {
+				return nil, err
+			}
+		}
+
+		sess := in.CurrentSession
+		recoveryMessage := in.Prompt
+		recoveryAction := "resend_prompt"
+		if in.SawAssistantChunk {
+			recoveryMessage = "continue"
+			recoveryAction = "continue"
+		}
+		log.Printf("[session/recovery] send.start root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
+		if err := in.SendWithAttachment(sess, recoveryMessage); err != nil {
+			if isCanceledTurnError(err) || ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			log.Printf("[session/recovery] send.failed root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
+			continue
+		}
+		log.Printf("[session/recovery] send.done root=%s session=%s agent=%s attempt=%d/%d action=%s", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction)
+		return sess, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("agent recovery failed")
+	}
+	return nil, lastErr
+}
+
+func waitForRecoveryDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) error {
+	if err := s.ensureRegistry(); err != nil {
+		return err
+	}
+	sessionKey := strings.TrimSpace(in.SessionKey)
+	if sessionKey == "" {
+		return errors.New("session key required")
+	}
+	agentName := strings.TrimSpace(in.Agent)
+	if agentName == "" {
+		manager, err := s.Registry.GetSessionManager(in.RootID)
+		if err != nil {
+			return err
+		}
+		current, err := manager.Get(ctx, sessionKey, 0)
+		if err != nil {
+			return err
+		}
+		agentName = strings.TrimSpace(session.InferAgentFromSession(current))
+	}
+	if agentName == "" {
+		return errors.New("agent required")
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return errors.New("agent pool unavailable")
+	}
+	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
+	if !ok {
+		return errors.New("agent session not found")
+	}
+	return sess.AnswerQuestion(ctx, agenttypes.AskUserAnswer{
+		ToolUseID: strings.TrimSpace(in.ToolUseID),
+		Answers:   in.Answers,
+	})
+}
+
+func currentAssistantLine(responseText string) int {
+	if responseText == "" {
+		return 0
+	}
+	return strings.Count(responseText, "\n") + 1
+}
+
+func dedupeExchangeAuxBuffer(items []session.ExchangeAux) []session.ExchangeAux {
+	if len(items) == 0 {
+		return nil
+	}
+	seenToolCallIDs := make(map[string]struct{}, len(items))
+	out := make([]session.ExchangeAux, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		callID := ""
+		if item.ToolCall != nil {
+			callID = strings.TrimSpace(item.ToolCall.CallID)
+		}
+		if callID != "" {
+			if _, exists := seenToolCallIDs[callID]; exists {
+				continue
+			}
+			seenToolCallIDs[callID] = struct{}{}
+		}
+		out = append(out, item)
+	}
+	for left, right := 0, len(out)-1; left < right; left, right = left+1, right-1 {
+		out[left], out[right] = out[right], out[left]
+	}
+	return out
 }
 
 func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) string {
 	if responseText != "" &&
 		(lastResponseUpdateType == string(agenttypes.EventTypeThoughtChunk) ||
 			lastResponseUpdateType == string(agenttypes.EventTypeToolCall) ||
-			lastResponseUpdateType == string(agenttypes.EventTypeToolUpdate)) &&
+			lastResponseUpdateType == string(agenttypes.EventTypeToolUpdate) ||
+			lastResponseUpdateType == string(agenttypes.EventTypeTodoUpdate)) &&
 		!strings.HasSuffix(responseText, "\n\n") &&
 		!strings.HasSuffix(responseText, "\n") {
 		responseText += "\n\n"
@@ -1145,11 +1445,15 @@ func normalizeAgentUpdatePaths(root pathNormalizer, update agenttypes.Event) age
 	for i := range toolCall.Locations {
 		toolCall.Locations[i].Path = normalizeToolPath(root, toolCall.Locations[i].Path)
 	}
-	for i := range toolCall.Content {
-		toolCall.Content[i].Path = normalizeToolPath(root, toolCall.Content[i].Path)
-		if toolCall.Content[i].Type == "text" {
-			toolCall.Content[i].Text = normalizeDiffTextPaths(root, toolCall.Content[i].Text)
+	if session.PreserveToolCallContent(toolCall.Kind) {
+		for i := range toolCall.Content {
+			toolCall.Content[i].Path = normalizeToolPath(root, toolCall.Content[i].Path)
+			if toolCall.Content[i].Type == "text" {
+				toolCall.Content[i].Text = normalizeDiffTextPaths(root, toolCall.Content[i].Text)
+			}
 		}
+	} else {
+		toolCall.Content = nil
 	}
 	if toolCall.Meta != nil {
 		if filePath, ok := toolCall.Meta["filePath"].(string); ok {
@@ -1160,6 +1464,16 @@ func normalizeAgentUpdatePaths(root pathNormalizer, update agenttypes.Event) age
 		}
 	}
 	update.Data = toolCall
+	return update
+}
+
+func compactAgentUpdate(update agenttypes.Event) agenttypes.Event {
+	switch update.Type {
+	case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate:
+		if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
+			update.Data = session.CompactToolCall(toolCall)
+		}
+	}
 	return update
 }
 
@@ -1283,10 +1597,8 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 	}
 	active := getActiveTurn(in.RootID, current.Key)
 	if active == nil {
-		log.Printf("[session] turn.cancel.skip root=%s session=%s reason=no_active_turn", in.RootID, current.Key)
 		return nil
 	}
-	log.Printf("[session] turn.cancel.begin root=%s session=%s", in.RootID, current.Key)
 	active.cancel()
 	if active.session != nil {
 		if err := active.session.CancelCurrentTurn(); err != nil {
@@ -1294,6 +1606,5 @@ func (s *Service) CancelSessionTurn(ctx context.Context, in CancelSessionTurnInp
 			return err
 		}
 	}
-	log.Printf("[session] turn.cancel.done root=%s session=%s", in.RootID, current.Key)
 	return nil
 }

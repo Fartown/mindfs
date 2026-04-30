@@ -276,6 +276,10 @@ func (s *session) SendMessage(ctx context.Context, content string) error {
 	return s.proc.SendMessage(ctx, s.sessionKey, content)
 }
 
+func (s *session) AnswerQuestion(context.Context, types.AskUserAnswer) error {
+	return errors.New("ask user question is not supported by acp sessions")
+}
+
 func (s *session) CurrentModel() string {
 	if s == nil || s.proc == nil {
 		return ""
@@ -329,6 +333,15 @@ func (s *session) OnUpdate(onUpdate func(types.Event)) {
 			return
 		}
 		if onUpdate != nil {
+			if update.Type == UpdateTypeMessageDone {
+				contextWindow, _ := s.ContextWindow(context.Background())
+				onUpdate(types.Event{
+					Type:      types.EventTypeMessageDone,
+					SessionID: update.SessionID,
+					Data:      types.MessageDone{ContextWindow: contextWindow},
+				})
+				return
+			}
 			onUpdate(convertEvent(update))
 		}
 	})
@@ -336,6 +349,13 @@ func (s *session) OnUpdate(onUpdate func(types.Event)) {
 
 func (s *session) SessionID() string {
 	return s.proc.SessionID(s.sessionKey)
+}
+
+func (s *session) ContextWindow(_ context.Context) (types.ContextWindow, error) {
+	if s == nil || s.proc == nil {
+		return types.ContextWindow{}, errors.New("acp session not initialized")
+	}
+	return s.proc.SessionContextWindow(s.sessionKey), nil
 }
 
 func (s *session) Close() error {

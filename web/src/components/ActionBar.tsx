@@ -83,6 +83,13 @@ const chatBlurPlaceholders = [
 const MOBILE_BREAKPOINT = 768;
 const IME_ENTER_GUARD_MS = 120;
 
+function getAgentDefaults(agent?: AgentStatus | null) {
+  return {
+    model: agent?.default_model_id || agent?.current_model_id || "",
+    effort: agent?.default_effort || "",
+  };
+}
+
 function buildPendingAttachment(file: File): PendingAttachment {
   const isImage = file.type.startsWith("image/");
   const fallbackExt = file.type.split("/")[1] || "png";
@@ -231,10 +238,11 @@ export function ActionBar({
     if (!preferred) {
       return;
     }
+    const defaults = getAgentDefaults(preferred);
     setAgent(preferred.name);
-    setModel("");
+    setModel(defaults.model);
     setAgentMode("");
-    setEffort("");
+    setEffort(defaults.effort);
   }, [agent, agents, currentSession]);
 
   useEffect(() => {
@@ -255,7 +263,7 @@ export function ActionBar({
   const selectedModelInfo =
     (selectedAgent?.models ?? []).find((item) => item.id === model)
     || (selectedAgent?.models ?? []).find(
-      (item) => item.id === selectedAgent?.current_model_id,
+      (item) => item.id === (selectedAgent?.default_model_id || selectedAgent?.current_model_id),
     );
   const availableEfforts = selectedAgent?.efforts ?? [];
   const isCodexEffortAgent = selectedAgent?.name === "codex";
@@ -413,13 +421,18 @@ export function ActionBar({
         return [];
       });
       setIsMultiLine(false);
+      if (isMobile) {
+        requestAnimationFrame(() => editorRef.current?.blur());
+      }
     } catch (err) {
       reportError("file.write_failed", String((err as Error)?.message || "附件上传失败"));
     } finally {
       setSending(false);
-      requestAnimationFrame(() => editorRef.current?.focus());
+      if (!isMobile) {
+        requestAnimationFrame(() => editorRef.current?.focus());
+      }
     }
-  }, [serializedInput, pendingAttachments, isConnected, sending, agent, model, agentMode, onSendMessage, mode, currentRootId, supportsEffort, effort]);
+  }, [serializedInput, pendingAttachments, isConnected, sending, agent, model, agentMode, onSendMessage, mode, currentRootId, supportsEffort, effort, isMobile]);
 
   const handleCancel = useCallback(async () => {
     const sessionKey = currentSession?.key;
@@ -507,6 +520,21 @@ export function ActionBar({
     appendPendingAttachments(imageFiles);
   }, [appendPendingAttachments, currentRootId, sending]);
 
+  const resetForNewSession = useCallback(() => {
+    const nextAgent = agents.find((item) => item.name === agent)
+      || agents.find((item) => item.available)
+      || agents[0];
+    if (!nextAgent) {
+      return;
+    }
+    const defaults = getAgentDefaults(nextAgent);
+    setAgent(nextAgent.name);
+    setModel(defaults.model);
+    setAgentMode("");
+    setEffort(defaults.effort);
+    syncedSessionSignatureRef.current = "";
+  }, [agent, agents]);
+
   const handleDragStart = (e: React.MouseEvent | React.TouchEvent) => {
     const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
     dragStartRef.current = clientX;
@@ -515,10 +543,13 @@ export function ActionBar({
 
   const handleDragEnd = useCallback(() => {
     if (!isDragging) return;
-    if (dragX <= DRAG_THRESHOLD) onNewSession?.();
+    if (dragX <= DRAG_THRESHOLD) {
+      resetForNewSession();
+      onNewSession?.();
+    }
     setDragX(0);
     setIsDragging(false);
-  }, [isDragging, dragX, onNewSession]);
+  }, [isDragging, dragX, onNewSession, resetForNewSession]);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -778,10 +809,12 @@ export function ActionBar({
                 effort={effort}
                 agents={agents}
                 onAgentChange={(nextAgent, nextModel) => {
+                  const nextStatus = agents.find((item) => item.name === nextAgent);
+                  const defaults = getAgentDefaults(nextStatus);
                   setAgent(nextAgent);
-                  setModel(nextModel || "");
+                  setModel(nextModel || defaults.model);
                   setAgentMode("");
-                  setEffort("");
+                  setEffort(defaults.effort);
                 }}
                 onModeChange={(nextAgentMode) => setAgentMode(nextAgentMode || "")}
                 onEffortChange={(nextEffort) => setEffort(nextEffort || "")}

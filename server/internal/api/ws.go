@@ -12,6 +12,7 @@ import (
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/api/usecase"
+	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
 	"mindfs/server/internal/session"
@@ -130,9 +131,26 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		if e2eeManager := h.AppContext.GetE2EEManager(); e2eeManager != nil && e2eeManager.Enabled() {
+			sess, err := e2eeManager.SessionForClient(clientID)
+			if err != nil {
+				h.sendE2EEError(conn, "", err.Error())
+				continue
+			}
+			var envelope e2ee.CipherEnvelope
+			if err := json.Unmarshal(message, &envelope); err != nil {
+				h.sendE2EEError(conn, "", "e2ee_session_missing")
+				continue
+			}
+			message, err = e2ee.DecryptBytes(sess.Key, &envelope)
+			if err != nil {
+				h.sendE2EEError(conn, "", "e2ee_proof_invalid")
+				continue
+			}
+		}
 		var req WSRequest
 		if err := json.Unmarshal(message, &req); err != nil {
-			h.sendWSError(conn, "", "invalid_request", "invalid request")
+			h.sendWSError(conn, clientID, "", "invalid_request", "invalid request")
 			continue
 		}
 		h.handleWSRequest(r.Context(), conn, clientID, req)
@@ -279,40 +297,73 @@ func (h *WSHandler) pushInitialGitHubImports(clientID string) {
 func (h *WSHandler) handleWSRequest(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
 	switch req.Type {
 	case "ping":
-		h.handleWSPing(conn, req)
+		h.handleWSPing(conn, clientID, req)
 	case "session.message":
 		go h.handleSessionMessage(ctx, conn, clientID, req)
+	case "session.answer_question":
+		go h.handleSessionAnswerQuestion(ctx, conn, clientID, req)
 	case "session.ready":
 		go h.handleSessionReady(clientID, req)
 	case "session.cancel":
 		h.handleSessionCancel(ctx, conn, clientID, req)
 	default:
-		h.sendWSError(conn, req.ID, "method_not_found", "method not found")
+		h.sendWSError(conn, clientID, req.ID, "method_not_found", "method not found")
 	}
 }
 
-func (h *WSHandler) handleWSPing(conn *websocket.Conn, req WSRequest) {
+func (h *WSHandler) handleSessionAnswerQuestion(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
+	rootID := getString(req.Payload, "root_id")
+	key := getString(req.Payload, "session_key")
+	agentName := getString(req.Payload, "agent")
+	toolUseID := getString(req.Payload, "tool_use_id")
+	if key == "" || toolUseID == "" {
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "session_key and tool_use_id required")
+		return
+	}
+	answers := parseStringMap(req.Payload["answers"])
+	if len(answers) == 0 {
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "answers required")
+		return
+	}
+	uc := &usecase.Service{Registry: h.AppContext}
+	if err := uc.AnswerQuestion(ctx, usecase.AnswerQuestionInput{
+		RootID:     rootID,
+		SessionKey: key,
+		Agent:      agentName,
+		ToolUseID:  toolUseID,
+		Answers:    answers,
+	}); err != nil {
+		h.sendWSError(conn, clientID, req.ID, "session.answer_question_failed", err.Error())
+		return
+	}
+	_ = h.writeWSJSON(clientID, conn, WSResponse{
+		ID:      req.ID,
+		Type:    "session.answer_question.accepted",
+		Payload: map[string]any{"root_id": rootID, "session_key": key, "tool_use_id": toolUseID},
+	})
+}
+
+func (h *WSHandler) handleWSPing(conn *websocket.Conn, clientID string, req WSRequest) {
 	resp := WSResponse{
 		ID:      req.ID,
 		Type:    "pong",
 		Payload: map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano)},
 	}
-	_ = h.writeWSJSON(conn, resp)
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
 	rootID := getString(req.Payload, "root_id")
 	key := getString(req.Payload, "session_key")
+	requestID := strings.TrimSpace(req.ID)
 	content := getString(req.Payload, "content")
 	sessionType := getString(req.Payload, "type")
 	agentName := getString(req.Payload, "agent")
 	model := getString(req.Payload, "model")
 	agentMode := getString(req.Payload, "agent_mode")
 	effort := getString(req.Payload, "effort")
-	requestID := strings.TrimSpace(req.ID)
-	log.Printf("[ws] session.message.begin root=%s session=%s request=%s type=%s agent=%s model=%q client=%s", rootID, key, requestID, sessionType, agentName, model, clientID)
 	if content == "" || sessionType == "" || agentName == "" {
-		h.sendWSError(conn, req.ID, "invalid_request", "content, type and agent required")
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "content, type and agent required")
 		return
 	}
 
@@ -320,7 +371,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	streamHub := h.AppContext.GetSessionStreamHub()
 	if requestID != "" {
 		if !h.reserveClientRequest(requestID) {
-			h.sendWSAccepted(conn, requestID, rootID, key)
+			h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 			return
 		}
 	}
@@ -337,7 +388,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 			},
 		})
 		if err != nil {
-			h.sendWSError(conn, req.ID, "session.create_failed", err.Error())
+			h.sendWSError(conn, clientID, req.ID, "session.create_failed", err.Error())
 			return
 		}
 		key = created.Key
@@ -364,7 +415,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		}(rootID, key, agentName, content)
 	}
 	if requestID != "" {
-		h.sendWSAccepted(conn, requestID, rootID, key)
+		h.sendWSAccepted(conn, clientID, requestID, rootID, key)
 	}
 	if h.AppContext != nil {
 		streamHub.BindSessionClient(key, clientID)
@@ -401,8 +452,6 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 			Data: map[string]string{"message": errorMessage},
 		}
 		streamHub.BroadcastSessionStream(rootID, key, event)
-	} else {
-		log.Printf("[ws] session.message.success root=%s session=%s request=%s", rootID, key, req.ID)
 	}
 	streamHub.ClearSessionPending(key)
 
@@ -434,11 +483,11 @@ func (h *WSHandler) sessionMessageContext() (context.Context, context.CancelFunc
 	return context.WithCancel(parentCtx)
 }
 
-func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Conn, _ string, req WSRequest) {
+func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
 	rootID := getString(req.Payload, "root_id")
 	key := getString(req.Payload, "session_key")
 	if rootID == "" || key == "" {
-		h.sendWSError(conn, req.ID, "invalid_request", "root_id and session_key required")
+		h.sendWSError(conn, clientID, req.ID, "invalid_request", "root_id and session_key required")
 		return
 	}
 	log.Printf("[ws] session.cancel root=%s session=%s request=%s", rootID, key, req.ID)
@@ -449,13 +498,12 @@ func (h *WSHandler) handleSessionCancel(ctx context.Context, conn *websocket.Con
 		Key:    key,
 	}); err != nil {
 		log.Printf("[ws] session.cancel.error root=%s session=%s request=%s err=%v", rootID, key, req.ID, err)
-		h.sendWSError(conn, req.ID, "session.cancel_failed", err.Error())
+		h.sendWSError(conn, clientID, req.ID, "session.cancel_failed", err.Error())
 		return
 	}
-	log.Printf("[ws] session.cancel.done root=%s session=%s request=%s", rootID, key, req.ID)
 }
 
-func (h *WSHandler) sendWSError(conn *websocket.Conn, id, code, message string) {
+func (h *WSHandler) sendWSError(conn *websocket.Conn, clientID, id, code, message string) {
 	resp := WSResponse{
 		ID:   id,
 		Type: "session.error",
@@ -465,10 +513,21 @@ func (h *WSHandler) sendWSError(conn *websocket.Conn, id, code, message string) 
 		},
 		Payload: map[string]any{},
 	}
-	_ = h.writeWSJSON(conn, resp)
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
-func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, requestID, rootID, sessionKey string) {
+func (h *WSHandler) sendE2EEError(conn *websocket.Conn, id, code string) {
+	resp := WSResponse{
+		ID:   id,
+		Type: "e2ee.error",
+		Payload: map[string]any{
+			"code": code,
+		},
+	}
+	_ = h.writeWSJSON("", conn, resp)
+}
+
+func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, clientID, requestID, rootID, sessionKey string) {
 	resp := WSResponse{
 		ID:   requestID,
 		Type: "session.accepted",
@@ -478,7 +537,7 @@ func (h *WSHandler) sendWSAccepted(conn *websocket.Conn, requestID, rootID, sess
 			"session_key": sessionKey,
 		},
 	}
-	_ = h.writeWSJSON(conn, resp)
+	_ = h.writeWSJSON(clientID, conn, resp)
 }
 
 func (h *WSHandler) reserveClientRequest(requestID string) bool {
@@ -504,9 +563,9 @@ func (h *WSHandler) reserveClientRequest(requestID string) bool {
 	return true
 }
 
-func (h *WSHandler) writeWSJSON(conn *websocket.Conn, resp WSResponse) error {
+func (h *WSHandler) writeWSJSON(clientID string, conn *websocket.Conn, resp WSResponse) error {
 	if h.AppContext != nil {
-		return h.AppContext.GetSessionStreamHub().WriteJSON(conn, resp)
+		return h.AppContext.GetSessionStreamHub().WriteJSON(clientID, conn, resp)
 	}
 	return conn.WriteJSON(resp)
 }
@@ -529,8 +588,20 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 		if tu, ok := update.Data.(agenttypes.ToolCall); ok {
 			return &StreamEvent{Type: "tool_call_update", Data: tu}
 		}
+	case agenttypes.EventTypeTodoUpdate:
+		if todo, ok := update.Data.(agenttypes.TodoUpdate); ok {
+			return &StreamEvent{Type: "todo_update", Data: todo}
+		}
 	case agenttypes.EventTypeMessageDone:
-		return &StreamEvent{Type: "message_done"}
+		if done, ok := update.Data.(agenttypes.MessageDone); ok {
+			return &StreamEvent{Type: "message_done", Data: done}
+		}
+		return &StreamEvent{Type: "message_done", Data: agenttypes.MessageDone{}}
+	case agenttypes.EventTypeRecovery:
+		if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
+			return &StreamEvent{Type: "recovery", Data: recovery}
+		}
+		return &StreamEvent{Type: "recovery", Data: agenttypes.RecoveryStatus{}}
 	}
 	return nil
 }
@@ -562,6 +633,37 @@ func getString(payload map[string]any, key string) string {
 		}
 	}
 	return ""
+}
+
+func parseStringMap(raw any) map[string]string {
+	items, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(items))
+	for key, value := range items {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		switch v := value.(type) {
+		case string:
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				out[key] = trimmed
+			}
+		case []any:
+			parts := make([]string, 0, len(v))
+			for _, item := range v {
+				if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+					parts = append(parts, strings.TrimSpace(text))
+				}
+			}
+			if len(parts) > 0 {
+				out[key] = strings.Join(parts, ", ")
+			}
+		}
+	}
+	return out
 }
 
 func parseClientContext(payload map[string]any, rootID string) usecase.ClientContext {

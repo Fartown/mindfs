@@ -1,5 +1,6 @@
 import React from "react";
 import type { GitDiffPayload } from "../services/git";
+import { rootBadgeStyle } from "./rootBadgeStyle";
 
 type GitDiffViewerProps = {
   diff: GitDiffPayload;
@@ -32,7 +33,12 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string | null; path: 
         <>
           <span
             onClick={() => onPathClick?.(".")}
-            style={{ fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
+            style={{
+              ...rootBadgeStyle,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              cursor: "pointer",
+            }}
             onMouseEnter={(e) => { e.currentTarget.style.textDecoration = "underline"; }}
             onMouseLeave={(e) => { e.currentTarget.style.textDecoration = "none"; }}
           >
@@ -264,7 +270,7 @@ export function GitDiffViewer({ diff, root, onPathClick, onSessionClick, onSelec
 
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
-      <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", boxSizing: "border-box", flexShrink: 0 }}>
+      <header style={{ height: "36px", padding: "0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", gap: "10px", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", overflow: "hidden", flex: 1, minWidth: 0 }}>
           <Breadcrumbs root={root} path={diff.path} onPathClick={onPathClick} />
           {relatedSessions.length > 0 ? (
