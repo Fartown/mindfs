@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -122,5 +123,43 @@ func TestLoadConfigReadsRelayBaseURL(t *testing.T) {
 	cfg := loadPoolTestConfig(t)
 	if cfg.RelayBaseURL != "https://relay.example.com" {
 		t.Fatalf("relay base url = %q", cfg.RelayBaseURL)
+	}
+}
+
+func TestLoadConfigPrefersWorkingDirAgentsJSONForRelativeLaunch(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "agents.json")
+	if err := os.WriteFile(configPath, []byte(`{"agents":[{"name":"local-agent","command":"local-agent"}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Chdir(tempDir)
+	originalArgs := os.Args
+	os.Args = []string{"./mindfs"}
+	t.Cleanup(func() { os.Args = originalArgs })
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if _, ok := cfg.GetAgent("local-agent"); !ok {
+		t.Fatalf("expected local-agent from working directory agents.json")
+	}
+}
+
+func TestLoadConfigPrefersAgentsConfigEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "agents.json")
+	if err := os.WriteFile(configPath, []byte(`{"agents":[{"name":"env-agent","command":"env-agent"}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(configPathEnvKey, configPath)
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if _, ok := cfg.GetAgent("env-agent"); !ok {
+		t.Fatalf("expected env-agent from %s", configPathEnvKey)
 	}
 }
