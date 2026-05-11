@@ -10,6 +10,8 @@ import (
 	configpkg "mindfs/server/internal/config"
 )
 
+const configPathEnvKey = "MINDFS_AGENTS_CONFIG"
+
 // Config holds all agent configurations.
 type Config struct {
 	Agents       []Definition `json:"agents"`
@@ -88,11 +90,33 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func defaultConfigPath() (string, error) {
+	if hinted := strings.TrimSpace(os.Getenv(configPathEnvKey)); hinted != "" {
+		return hinted, nil
+	}
+	if shouldPreferWorkingDirConfig() {
+		if cwd, err := os.Getwd(); err == nil {
+			candidate := filepath.Join(cwd, "agents.json")
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate, nil
+			}
+		}
+	}
 	configDir, err := configpkg.MindFSConfigDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(configDir, "agents.json"), nil
+}
+
+func shouldPreferWorkingDirConfig() bool {
+	if len(os.Args) == 0 {
+		return false
+	}
+	arg0 := strings.TrimSpace(os.Args[0])
+	if arg0 == "" {
+		return false
+	}
+	return strings.HasPrefix(arg0, "."+string(os.PathSeparator))
 }
 
 func installedDefaultConfigPath() (string, error) {

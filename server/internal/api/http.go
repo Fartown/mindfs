@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	htmpl "html/template"
 	"io"
 	"log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,6 +51,7 @@ const (
 	clientIDHeaderName    = "X-MindFS-Client-ID"
 	e2eeProofHeaderName   = "X-MindFS-Proof"
 	e2eeTSHeaderName      = "X-MindFS-TS"
+	localCLIHeaderName    = "X-MindFS-Local-CLI"
 	fileProofMaxSkew      = 5 * time.Minute
 )
 
@@ -75,34 +78,34 @@ func (h *HTTPHandler) requireProtectedHTTPSession(r *http.Request) (*e2ee.Sessio
 	return sess, true, nil
 }
 
-func (h *HTTPHandler) requireFileProof(r *http.Request) error {
+func (h *HTTPHandler) requireFileProof(r *http.Request) (*e2ee.Session, error) {
 	manager := h.AppContext.GetE2EEManager()
 	if manager == nil || !manager.Enabled() {
-		return nil
+		return nil, nil
 	}
 	clientID := strings.TrimSpace(r.Header.Get(clientIDHeaderName))
 	ts := strings.TrimSpace(r.Header.Get(e2eeTSHeaderName))
 	proof := strings.TrimSpace(r.Header.Get(e2eeProofHeaderName))
 	if clientID == "" || ts == "" || proof == "" {
-		return errInvalidRequest("e2ee_proof_required")
+		return nil, errInvalidRequest("e2ee_proof_required")
 	}
 	sess, err := manager.SessionForClient(clientID)
 	if err != nil {
-		return errInvalidRequest(err.Error())
+		return nil, errInvalidRequest(err.Error())
 	}
 	timestamp, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
-		return errInvalidRequest("invalid_e2ee_ts")
+		return nil, errInvalidRequest("invalid_e2ee_ts")
 	}
 	now := time.Now().UTC()
 	if timestamp.Before(now.Add(-fileProofMaxSkew)) || timestamp.After(now.Add(fileProofMaxSkew)) {
-		return errInvalidRequest("e2ee_proof_expired")
+		return nil, errInvalidRequest("e2ee_proof_expired")
 	}
 	expected := e2ee.BuildRequestProof(sess.Key, r.Method, requestProofPath(r), ts, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
-		return errInvalidRequest("e2ee_proof_invalid")
+		return nil, errInvalidRequest("e2ee_proof_invalid")
 	}
-	return nil
+	return sess, nil
 }
 
 func requestProofPath(r *http.Request) string {
@@ -143,6 +146,10 @@ func (w *protectedResponseWriter) Write(payload []byte) (int, error) {
 
 func (h *HTTPHandler) protectedEndpoint(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if isLocalCLIRequest(r) {
+			next(w, r)
+			return
+		}
 		sess, protected, err := h.requireProtectedHTTPSession(r)
 		if !protected {
 			next(w, r)
@@ -187,6 +194,18 @@ func (h *HTTPHandler) protectedEndpoint(next http.HandlerFunc) http.HandlerFunc 
 	}
 }
 
+func isLocalCLIRequest(r *http.Request) bool {
+	if strings.TrimSpace(r.Header.Get(localCLIHeaderName)) != "1" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (h *HTTPHandler) broadcastRootChanged(action, rootID string) {
 	if h.AppContext == nil {
 		return
@@ -205,35 +224,36 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", h.handleFrontend)
 	r.Get("/health", h.handleHealth)
-	r.Get("/api/tree", h.handleTree)
+	r.Get("/api/tree", h.protectedEndpoint(h.handleTree))
 	r.Get("/api/file", h.handleFile)
-	r.Get("/api/git/status", h.handleGitStatus)
-	r.Get("/api/git/diff", h.handleGitDiff)
+	r.Get("/api/git/status", h.protectedEndpoint(h.handleGitStatus))
+	r.Get("/api/git/diff", h.protectedEndpoint(h.handleGitDiff))
 	r.Post("/api/upload", h.handleUpload)
-	r.Get("/api/candidates", h.handleCandidates)
-	r.Post("/api/prompts", h.handlePromptSave)
-	r.Get("/api/sessions", h.handleSessions)
-	r.Get("/api/sessions/search", h.handleSessionSearch)
-	r.Get("/api/sessions/external", h.handleExternalSessionsList)
-	r.Post("/api/sessions/import", h.handleExternalSessionImport)
+	r.Get("/api/candidates", h.protectedEndpoint(h.handleCandidates))
+	r.Post("/api/prompts", h.protectedEndpoint(h.handlePromptSave))
+	r.Get("/api/sessions", h.protectedEndpoint(h.handleSessions))
+	r.Get("/api/replying-sessions", h.protectedEndpoint(h.handleReplyingSessions))
+	r.Get("/api/sessions/search", h.protectedEndpoint(h.handleSessionSearch))
+	r.Get("/api/sessions/external", h.protectedEndpoint(h.handleExternalSessionsList))
+	r.Post("/api/sessions/import", h.protectedEndpoint(h.handleExternalSessionImport))
 	r.Get("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionGet))
-	r.Get("/api/sessions/{key}/related-files", h.handleSessionRelatedFilesGet)
-	r.Post("/api/sessions/{key}/rename", h.handleSessionRename)
-	r.Delete("/api/sessions/{key}/related-files", h.handleSessionRelatedFilesDelete)
-	r.Delete("/api/sessions/{key}", h.handleSessionDelete)
-	r.Get("/api/dirs", h.handleDirs)
-	r.Post("/api/dirs", h.handleAddDir)
-	r.Delete("/api/dirs", h.handleRemoveDir)
-	r.Get("/api/local_dirs", h.handleLocalDirs)
+	r.Get("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesGet))
+	r.Post("/api/sessions/{key}/rename", h.protectedEndpoint(h.handleSessionRename))
+	r.Delete("/api/sessions/{key}/related-files", h.protectedEndpoint(h.handleSessionRelatedFilesDelete))
+	r.Delete("/api/sessions/{key}", h.protectedEndpoint(h.handleSessionDelete))
+	r.Get("/api/dirs", h.protectedEndpoint(h.handleDirs))
+	r.Post("/api/dirs", h.protectedEndpoint(h.handleAddDir))
+	r.Delete("/api/dirs", h.protectedEndpoint(h.handleRemoveDir))
+	r.Get("/api/local_dirs", h.protectedEndpoint(h.handleLocalDirs))
 	r.Get("/api/relay/status", h.handleRelayStatus)
-	r.Get("/api/relay/tips", h.handleRelayTips)
+	r.Get("/api/relay/tips", h.protectedEndpoint(h.handleRelayTips))
 	r.Post("/api/e2ee/open", h.handleE2EEOpen)
-	r.Get("/api/app/update", h.handleAppUpdateGet)
-	r.Post("/api/app/update", h.handleAppUpdatePost)
-	r.Post("/api/imports/github", h.handleGitHubImportStart)
+	r.Get("/api/app/update", h.protectedEndpoint(h.handleAppUpdateGet))
+	r.Post("/api/app/update", h.protectedEndpoint(h.handleAppUpdatePost))
+	r.Post("/api/imports/github", h.protectedEndpoint(h.handleGitHubImportStart))
 
 	// Agent status API
-	r.Get("/api/agents", h.handleAgentsList)
+	r.Get("/api/agents", h.protectedEndpoint(h.handleAgentsList))
 	r.NotFound(h.handleNotFound)
 
 	return r
@@ -271,6 +291,41 @@ func (h *HTTPHandler) handleSessions(w http.ResponseWriter, r *http.Request) {
 		payload = append(payload, sessionListResponse(s))
 	}
 	respondJSON(w, http.StatusOK, payload)
+}
+
+func (h *HTTPHandler) handleReplyingSessions(w http.ResponseWriter, r *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetSessionStreamHub() == nil {
+		respondJSON(w, http.StatusOK, map[string]any{"sessions": []map[string]any{}})
+		return
+	}
+	items := h.AppContext.GetSessionStreamHub().ListReplyingSessions()
+	payload := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		rootTitle := item.RootID
+		sessionTitle := strings.TrimSpace(item.SessionTitle)
+		if root, err := h.AppContext.GetRoot(item.RootID); err == nil {
+			if strings.TrimSpace(root.Name) != "" {
+				rootTitle = root.Name
+			}
+			if sessionTitle == "" {
+				if manager, err := h.AppContext.GetSessionManager(item.RootID); err == nil {
+					if sess, err := manager.Get(r.Context(), item.SessionKey, 0); err == nil && sess != nil {
+						sessionTitle = sess.Name
+					}
+				}
+			}
+		}
+		payload = append(payload, map[string]any{
+			"rootId":       item.RootID,
+			"rootTitle":    rootTitle,
+			"sessionKey":   item.SessionKey,
+			"sessionTitle": sessionTitle,
+			"status":       item.Status,
+			"summary":      item.Summary,
+			"updatedAt":    item.UpdatedAt,
+		})
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"sessions": payload})
 }
 
 func (h *HTTPHandler) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
@@ -753,7 +808,7 @@ func (h *HTTPHandler) handleFrontend(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(rewriteRelayedFrontendContent(indexHTML)))
 		return
 	}
-	w.Write([]byte(indexHTML))
+	w.Write([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(r.URL.Path))))
 }
 
 func (h *HTTPHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -781,7 +836,8 @@ func (h *HTTPHandler) serveStaticAsset(w http.ResponseWriter, r *http.Request) b
 	}
 
 	assetPath := filepath.Join(staticDir, cleanPath)
-	if info, err := os.Stat(assetPath); err == nil && !info.IsDir() {
+	info, statErr := os.Stat(assetPath)
+	if statErr == nil && !info.IsDir() {
 		applyStaticCacheHeaders(w, cleanPath)
 		if isRelayedRequest(r) && shouldRewriteRelayedStaticAsset(cleanPath) {
 			serveRewrittenStaticAsset(w, r, assetPath)
@@ -804,6 +860,25 @@ func (h *HTTPHandler) serveStaticAsset(w http.ResponseWriter, r *http.Request) b
 	}
 
 	return false
+}
+
+func frontendAssetMissingNotice(requestPath string) string {
+	cleanPath := pathForStaticAsset(requestPath)
+	if cleanPath == "" {
+		cleanPath = "index.html"
+	}
+	displayPath := filepath.ToSlash(cleanPath)
+	return fmt.Sprintf("frontend assets missing: web/%s not found. Please reinstall or check the install directory.", displayPath)
+}
+
+func renderFallbackFrontend(content, notice string) string {
+	out := content
+	noticeHTML := ""
+	if strings.TrimSpace(notice) != "" {
+		noticeHTML = `<div class="notice is-visible">` + htmpl.HTMLEscapeString(notice) + `</div>`
+	}
+	out = strings.ReplaceAll(out, "__FALLBACK_NOTICE__", noticeHTML)
+	return out
 }
 
 func applyStaticCacheHeaders(w http.ResponseWriter, cleanPath string) {
@@ -901,7 +976,8 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.URL.Query().Get("raw")
-	if err := h.requireFileProof(r); err != nil {
+	proofSession, err := h.requireFileProof(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, err)
 		return
 	}
@@ -954,9 +1030,16 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"file": out.File,
-	})
+	}
+	if proofSession != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+			respondError(w, http.StatusServiceUnavailable, err)
+		}
+		return
+	}
+	respondJSON(w, http.StatusOK, payload)
 }
 
 func (h *HTTPHandler) handleGitStatus(w http.ResponseWriter, r *http.Request) {
@@ -1003,7 +1086,8 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
 		return
 	}
-	if err := h.requireFileProof(r); err != nil {
+	proofSession, err := h.requireFileProof(r)
+	if err != nil {
 		respondError(w, http.StatusUnauthorized, err)
 		return
 	}
@@ -1046,9 +1130,16 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, status, err)
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"files": out.Files,
-	})
+	}
+	if proofSession != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+			respondError(w, http.StatusServiceUnavailable, err)
+		}
+		return
+	}
+	respondJSON(w, http.StatusOK, payload)
 }
 
 func buildUploadFiles(headers []*multipart.FileHeader) ([]usecase.UploadFile, error) {
@@ -1315,6 +1406,20 @@ const indexHTML = `<!doctype html>
         background: #f7f7f5;
         color: #222;
       }
+      .notice {
+        display: none;
+        margin: 12px;
+        padding: 10px 12px;
+        border: 1px solid #d8b4b4;
+        border-radius: 6px;
+        background: #fff5f5;
+        color: #8a1f1f;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .notice.is-visible {
+        display: block;
+      }
       .shell {
         display: grid;
         grid-template-columns: 260px 1fr;
@@ -1379,6 +1484,7 @@ const indexHTML = `<!doctype html>
     </style>
   </head>
   <body>
+    __FALLBACK_NOTICE__
     <div class="shell">
       <aside>
         <h3>Files</h3>

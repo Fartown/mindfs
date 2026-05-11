@@ -19,6 +19,16 @@ import {
 } from "./services/session";
 import { buildClientContext } from "./services/context";
 import { e2eeService, type E2EEState } from "./services/e2ee";
+import {
+  bootstrapService,
+  type BootstrapState,
+  type RelayStatusPayload,
+} from "./services/bootstrap";
+import { syncNativeReplyPollerE2EE } from "./services/replyPoller";
+import {
+  ProtectedAPIError,
+  protectedJSON as apiProtectedJSON,
+} from "./services/api";
 import { reportError } from "./services/error";
 import {
   fetchFile,
@@ -51,7 +61,6 @@ import {
   cancelScheduledWebViewCacheClear,
   scheduleWebViewCacheClearOnNextLaunch,
 } from "./services/nativeCacheControl";
-
 // 直接导入标准组件
 import { AppShell } from "./layout/AppShell";
 import { FileTree } from "./components/FileTree";
@@ -91,17 +100,27 @@ export type SessionItem = {
   created_at?: string;
   updated_at?: string;
   closed_at?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
   search_seq?: number;
   search_snippet?: string;
   search_match_type?: "name" | "user" | "reply";
   related_files?: RelatedFile[];
   exchanges?: Array<{
+    seq?: number;
     role?: string;
+    agent?: string;
     content?: string;
     timestamp?: string;
     model?: string;
     mode?: string;
     effort?: string;
+    context_window?: {
+      totalTokens: number;
+      modelContextWindow: number;
+    };
   }>;
   pending?: boolean;
 };
@@ -165,6 +184,15 @@ function toSessionItem(
       typeof session?.updated_at === "string" ? session.updated_at : undefined,
     closed_at:
       typeof session?.closed_at === "string" ? session.closed_at : undefined,
+    context_window:
+      session?.context_window &&
+      Number(session.context_window.totalTokens) > 0 &&
+      Number(session.context_window.modelContextWindow) > 0
+        ? {
+            totalTokens: Number(session.context_window.totalTokens),
+            modelContextWindow: Number(session.context_window.modelContextWindow),
+          }
+        : undefined,
     search_seq:
       typeof session?.search_seq === "number" ? session.search_seq : undefined,
     search_snippet:
@@ -253,18 +281,6 @@ type LocalDirsPayload = {
   path?: string;
   parent?: string;
   items?: LocalDirItemPayload[];
-};
-type RelayStatusPayload = {
-  relay_bound?: boolean;
-  no_relayer?: boolean;
-  pending_code?: string;
-  node_name?: string;
-  node_id?: string;
-  e2ee_node_id?: string;
-  relay_base_url?: string;
-  node_url?: string;
-  last_error?: string;
-  e2ee_required?: boolean;
 };
 const RELAY_LAST_NODE_ID_STORAGE_KEY = "mindfs.relay.last_node_id";
 const PLUGIN_QUERY_STORAGE_PREFIX = "vp-progress:";
@@ -832,6 +848,7 @@ export function App({ onGoHome }: AppProps) {
   const pluginsLoadedByRootRef = useRef<Record<string, boolean>>({});
   const pluginsLoadingByRootRef = useRef<Record<string, Promise<void>>>({});
   const didInitRef = useRef(false);
+  const managedRootsRequestRef = useRef<Promise<ManagedRootPayload[] | null> | null>(null);
   const handleSelectSessionRef = useRef<
     ((session: any) => Promise<void>) | null
   >(null);
@@ -916,6 +933,9 @@ export function App({ onGoHome }: AppProps) {
   });
   const [relayStatus, setRelayStatus] = useState<RelayStatusPayload | null>(
     null,
+  );
+  const [bootstrapState, setBootstrapState] = useState<BootstrapState>(() =>
+    bootstrapService.snapshot(),
   );
   const [e2eeState, setE2eeState] = useState<E2EEState>(() =>
     e2eeService.snapshot(),
@@ -1114,6 +1134,9 @@ export function App({ onGoHome }: AppProps) {
   }, [currentRootId]);
   useEffect(() => {
     let cancelled = false;
+    if (!e2eeState.configured || (e2eeState.required && !e2eeState.unlocked)) {
+      return;
+    }
     fetchAgents(true)
       .then((items) => {
         if (cancelled) return;
@@ -1123,7 +1146,7 @@ export function App({ onGoHome }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [agentsVersion]);
+  }, [agentsVersion, e2eeState.configured, e2eeState.required, e2eeState.unlocked]);
   useEffect(() => {
     if (!importMenuOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -2104,7 +2127,10 @@ export function App({ onGoHome }: AppProps) {
         const list = [...(prevList || [])];
         for (let i = list.length - 1; i >= 0; i -= 1) {
           const item = list[i];
-          if (item?.role === "agent" || item?.role === "assistant") {
+          if (
+            (item?.role === "agent" || item?.role === "assistant") &&
+            String(item?.content || "").trim()
+          ) {
             list[i] = {
               ...item,
               context_window: {
@@ -2123,6 +2149,10 @@ export function App({ onGoHome }: AppProps) {
         sessionCacheRef.current[cacheKey] = {
           ...(cached as any),
           exchanges,
+          context_window: {
+            totalTokens,
+            modelContextWindow,
+          },
           updated_at: new Date().toISOString(),
         } as Session;
       }
@@ -2135,6 +2165,10 @@ export function App({ onGoHome }: AppProps) {
         return {
           ...(prev as any),
           exchanges: stampList((((prev as any).exchanges || []) as Exchange[])),
+          context_window: {
+            totalTokens,
+            modelContextWindow,
+          },
         } as SessionItem;
       });
       const drawer = drawerSessionByRootRef.current[rootID];
@@ -2142,6 +2176,10 @@ export function App({ onGoHome }: AppProps) {
         setDrawerSessionForRoot(rootID, {
           ...(drawer as any),
           exchanges: stampList((((drawer as any).exchanges || []) as Exchange[])),
+          context_window: {
+            totalTokens,
+            modelContextWindow,
+          },
         } as Session);
       }
       bumpCacheVersion();
@@ -2181,14 +2219,9 @@ export function App({ onGoHome }: AppProps) {
   const refreshTreeDir = useCallback(
     async (rootID: string, dirPath: string, syncMain: boolean) => {
       try {
-        const res = await fetch(
-          appURL(
-            "/api/tree",
-            new URLSearchParams({ root: rootID, dir: dirPath }),
-          ),
+        const payload = await apiProtectedJSON<any>(
+          appURL("/api/tree", new URLSearchParams({ root: rootID, dir: dirPath })),
         );
-        if (!res.ok) return;
-        const payload = await res.json();
         const parsed = normalizeTreeResponse(payload);
         invalidTreeCacheKeysRef.current.delete(treeCacheKey(rootID, dirPath));
         setMainDirectoryError("");
@@ -3084,21 +3117,27 @@ export function App({ onGoHome }: AppProps) {
         effectiveAgentMode = agentMode || "",
         effectiveEffort = effort || "";
       if (sendSessionKey && session) {
+        const targetSessionKey = sendSessionKey;
         const previousAgent = session.agent || "";
+        const useTargetSessionDefaults =
+          !!currentBoundSessionKey && currentBoundSessionKey !== targetSessionKey;
         effectiveMode = normalizeMode(session.type as any);
-        effectiveAgent = agent || previousAgent || "";
+        effectiveAgent =
+          (useTargetSessionDefaults ? previousAgent : agent) ||
+          previousAgent ||
+          "";
         effectiveModel =
-          model ||
+          (useTargetSessionDefaults ? session.model || "" : model) ||
           (effectiveAgent === previousAgent ? session.model || "" : "");
         effectiveAgentMode =
-          agentMode ||
+          (useTargetSessionDefaults ? (session as any).mode || "" : agentMode) ||
           (effectiveAgent === previousAgent ? (session as any).mode || "" : "");
         effectiveEffort =
-          effort ||
+          (useTargetSessionDefaults ? (session as any).effort || "" : effort) ||
           (effectiveAgent === previousAgent ? (session as any).effort || "" : "");
         updateSessionAgentForKey(
           activeRoot,
-          sendSessionKey || undefined,
+          targetSessionKey,
           effectiveAgent,
           effectiveModel,
           effectiveAgentMode,
@@ -3111,8 +3150,8 @@ export function App({ onGoHome }: AppProps) {
           mode: effectiveAgentMode,
           effort: effectiveEffort,
         } as Session;
-        setBoundSessionForRoot(activeRoot, sendSessionKey);
-        setSelectedPendingByKey(sendSessionKey || undefined, true);
+        setBoundSessionForRoot(activeRoot, targetSessionKey);
+        setSelectedPendingByKey(targetSessionKey, true);
         setDrawerSessionForRoot(activeRoot, {
           ...(session as any),
           pending: true,
@@ -3253,9 +3292,10 @@ export function App({ onGoHome }: AppProps) {
         delete pendingRequestRef.current[requestId];
       }
       if (!sent && sendSessionKey) {
-        setSelectedPendingByKey(sendSessionKey || undefined, false);
+        const failedSessionKey = sendSessionKey;
+        setSelectedPendingByKey(failedSessionKey, false);
         const latest = drawerSessionByRootRef.current[activeRoot];
-        if (latest && latest.key === sendSessionKey) {
+        if (latest && latest.key === failedSessionKey) {
           setDrawerSessionForRoot(activeRoot, {
             ...(latest as any),
             pending: false,
@@ -3526,14 +3566,12 @@ export function App({ onGoHome }: AppProps) {
               continue;
             }
             try {
-              const res = await fetch(
+              const payload = await apiProtectedJSON<any>(
                 appURL(
                   "/api/tree",
                   new URLSearchParams({ root: String(root), dir }),
                 ),
               );
-              if (!res.ok) continue;
-              const payload = await res.json();
               const parsed = normalizeTreeResponse(payload);
               invalidTreeCacheKeysRef.current.delete(cacheKey);
               setEntriesByPath((prev) => ({
@@ -3701,32 +3739,9 @@ export function App({ onGoHome }: AppProps) {
             return;
           }
           try {
-            const res = await fetch(
+            const payload = await apiProtectedJSON<any>(
               appURL("/api/tree", new URLSearchParams({ root, dir: apiDir })),
             );
-            if (!res.ok) {
-              const payload = await res.json().catch(() => ({}));
-              if (
-                await handleRelayNavigationFailure(
-                  res.status,
-                  typeof payload?.error === "string" ? payload.error : "",
-                )
-              ) {
-                return;
-              }
-              const message = formatDirectoryLoadError(
-                typeof payload?.error === "string" ? payload.error : "",
-              );
-              setSelectedDir(targetPath);
-              setSelectedDirKey(
-                buildDirectorySelectionKey(root, targetPath, targetIsRoot),
-              );
-              setMainEntries([]);
-              setMainDirectoryError(message);
-              reportError("file.read_failed", message);
-              return;
-            }
-            const payload = await res.json();
             const parsed = normalizeTreeResponse(payload);
             invalidTreeCacheKeysRef.current.delete(cacheKey);
             setMainDirectoryError("");
@@ -3745,7 +3760,28 @@ export function App({ onGoHome }: AppProps) {
             fileCursorRef.current = 0;
             setDrawerOpenForRoot(root, false);
             if (isMobile) setIsLeftOpen(false);
-          } catch {
+          } catch (error) {
+            if (error instanceof ProtectedAPIError) {
+              if (
+                await handleRelayNavigationFailure(
+                  error.status,
+                  typeof error.payload?.error === "string" ? error.payload.error : "",
+                )
+              ) {
+                return;
+              }
+              const message = formatDirectoryLoadError(
+                typeof error.payload?.error === "string" ? error.payload.error : "",
+              );
+              setSelectedDir(targetPath);
+              setSelectedDirKey(
+                buildDirectorySelectionKey(root, targetPath, targetIsRoot),
+              );
+              setMainEntries([]);
+              setMainDirectoryError(message);
+              reportError("file.read_failed", message);
+              return;
+            }
             const message = "目录加载失败，请稍后重试。";
             setSelectedDir(targetPath);
             setSelectedDirKey(
@@ -3809,21 +3845,43 @@ export function App({ onGoHome }: AppProps) {
     actionHandlersRef.current = actionHandlers;
   }, [actionHandlers]);
 
-  const refreshManagedRoots = useCallback(async () => {
-    const response = await fetch(appPath("/api/dirs"));
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      if (
-        await handleRelayNavigationFailure(
-          response.status,
-          typeof payload?.error === "string" ? payload.error : "",
-        )
-      ) {
-        return;
+  const loadManagedRootPayloads = useCallback(async () => {
+    if (bootstrapService.snapshot().phase !== "ready") {
+      return null;
+    }
+    if (managedRootsRequestRef.current) {
+      return managedRootsRequestRef.current;
+    }
+    const request = (async () => {
+      try {
+        const dirs = await apiProtectedJSON<ManagedRootPayload[]>(appPath("/api/dirs"));
+        return Array.isArray(dirs) ? dirs : [];
+      } catch (error) {
+        if (!(error instanceof ProtectedAPIError)) {
+          return null;
+        }
+        if (
+          await handleRelayNavigationFailure(
+            error.status,
+            typeof error.payload?.error === "string" ? error.payload.error : "",
+          )
+        ) {
+          return null;
+        }
+        return null;
       }
+    })().finally(() => {
+      managedRootsRequestRef.current = null;
+    });
+    managedRootsRequestRef.current = request;
+    return request;
+  }, [bootstrapState.phase, handleRelayNavigationFailure]);
+
+  const refreshManagedRoots = useCallback(async () => {
+    const dirs = await loadManagedRootPayloads();
+    if (!dirs) {
       return;
     }
-    const dirs = (await response.json()) as ManagedRootPayload[];
     const nextDirs = Array.isArray(dirs) ? dirs : [];
     const nextRootIds = nextDirs.map((dir) => dir.id).filter(Boolean);
     managedRootByIdRef.current = Object.fromEntries(
@@ -3877,20 +3935,10 @@ export function App({ onGoHome }: AppProps) {
       preservePluginQuery: true,
       isRoot: true,
     });
-  }, [handleRelayNavigationFailure, replaceURLState]);
+  }, [loadManagedRootPayloads, replaceURLState]);
 
   const refreshRelayStatus = useCallback(async () => {
-    try {
-      const response = await fetch(appPath("/api/relay/status"));
-      if (!response.ok) {
-        return;
-      }
-      const payload = (await response.json()) as RelayStatusPayload;
-      setRelayStatus(payload);
-      return payload;
-    } catch {
-      return;
-    }
+    return bootstrapService.refreshRelayStatus();
   }, []);
 
   const handleCreateRootStart = useCallback((parentPath?: string | null) => {
@@ -3952,13 +4000,9 @@ export function App({ onGoHome }: AppProps) {
       selectedPath: "",
     }));
     try {
-      const response = await fetch(
+      const payload = await apiProtectedJSON<LocalDirsPayload>(
         appURL("/api/local_dirs", new URLSearchParams({ path: trimmed })),
       );
-      const payload = (await response.json().catch(() => ({}))) as LocalDirsPayload;
-      if (!response.ok) {
-        throw new Error(String((payload as any)?.message || (payload as any)?.error || "加载目录失败"));
-      }
       setLocalDirState({
         path: String(payload.path || trimmed),
         parent: String(payload.parent || ""),
@@ -4060,17 +4104,11 @@ export function App({ onGoHome }: AppProps) {
         creatingRootParentPath && creatingRootParentPath.trim()
           ? `${creatingRootParentPath.replace(/[\\/]+$/, "")}/${name}`
           : name;
-      const response = await fetch(appPath("/api/dirs"), {
+      const payload = await apiProtectedJSON<any>(appPath("/api/dirs"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: targetPath, create: true }),
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          String(payload?.message || payload?.error || "新建项目失败"),
-        );
-      }
       const created = payload as ManagedRootPayload;
       setCreatingRootName(null);
       setCreatingRootParentPath(null);
@@ -4135,17 +4173,11 @@ export function App({ onGoHome }: AppProps) {
     }
     setLocalDirState((prev) => ({ ...prev, adding: true, error: "" }));
     try {
-      const response = await fetch(appPath("/api/dirs"), {
+      const payload = await apiProtectedJSON<any>(appPath("/api/dirs"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path, create: false }),
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          String(payload?.message || payload?.error || "添加目录失败"),
-        );
-      }
       setLocalDirState((prev) => ({
         ...prev,
         adding: false,
@@ -4192,17 +4224,11 @@ export function App({ onGoHome }: AppProps) {
       message: "",
     }));
     try {
-      const response = await fetch(appPath("/api/imports/github"), {
+      const payload = await apiProtectedJSON<any>(appPath("/api/imports/github"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, parent_path: parentPath }),
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          String(payload?.message || payload?.error || "GitHub 导入失败"),
-        );
-      }
       setGitHubImportState((prev) => ({
         ...prev,
         taskId: String(payload?.task_id || ""),
@@ -4281,18 +4307,12 @@ export function App({ onGoHome }: AppProps) {
       return;
     }
     try {
-      const response = await fetch(
+      await apiProtectedJSON<any>(
         appURL("/api/dirs", new URLSearchParams({ path: rootPath })),
         {
           method: "DELETE",
         },
       );
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          String(payload?.message || payload?.error || "移除项目失败"),
-        );
-      }
       await refreshManagedRoots();
     } catch (err) {
       reportError(
@@ -4464,6 +4484,28 @@ export function App({ onGoHome }: AppProps) {
     },
     [file, sessions, handleSelectSession],
   );
+
+  useEffect(() => {
+    function openReplySession(detail: any) {
+      const rootId = typeof detail?.rootId === "string" ? detail.rootId.trim() : "";
+      const sessionKey = typeof detail?.sessionKey === "string" ? detail.sessionKey.trim() : "";
+      if (!rootId || !sessionKey) {
+        return;
+      }
+      handleSessionChipClick(sessionKey, rootId);
+    }
+
+    function handleOpenReplySession(event: Event) {
+      openReplySession((event as CustomEvent).detail);
+    }
+
+    window.addEventListener("mindfs:open-reply-session", handleOpenReplySession);
+    openReplySession((window as any).__mindfsPendingReplySession);
+    delete (window as any).__mindfsPendingReplySession;
+    return () => {
+      window.removeEventListener("mindfs:open-reply-session", handleOpenReplySession);
+    };
+  }, [handleSessionChipClick]);
 
   const handleFileViewerPathClick = useCallback(
     (path: string) => {
@@ -5527,27 +5569,17 @@ export function App({ onGoHome }: AppProps) {
         return;
       }
     }
-    fetch(appPath("/api/dirs"))
-      .then(async (r) => {
-        if (!r.ok) {
-          const payload = await r.json().catch(() => ({}));
-          if (
-            await handleRelayNavigationFailure(
-              r.status,
-              typeof payload?.error === "string" ? payload.error : "",
-            )
-          ) {
-            return null;
-          }
-          return null;
+    void (async () => {
+      try {
+        const bootstrap = await bootstrapService.start();
+        if (bootstrap.phase !== "ready") {
+          didInitRef.current = false;
+          return;
         }
-        return r.json();
-      })
-      .then(async (dirs) => {
+        const dirs = await loadManagedRootPayloads();
         if (!dirs) {
           return;
         }
-        void refreshRelayStatus();
         if (cancelled || !dirs.length) {
           return;
         }
@@ -5604,8 +5636,7 @@ export function App({ onGoHome }: AppProps) {
             await refreshTreeDir(preferredRoot, ".", false);
           }
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         if (cancelled) {
           return;
         }
@@ -5613,11 +5644,10 @@ export function App({ onGoHome }: AppProps) {
           "app.init_failed",
           String((err as Error)?.message || err || "初始化失败"),
         );
-      })
-      .finally(() => {
+      } finally {
         settled = true;
-      })
-    ;
+      }
+    })();
     return () => {
       cancelled = true;
       if (!settled) {
@@ -5627,11 +5657,20 @@ export function App({ onGoHome }: AppProps) {
   }, [
     ensurePluginsLoaded,
     handleRelayNavigationFailure,
+    loadManagedRootPayloads,
     loadSessionsForRoot,
-    refreshRelayStatus,
     refreshTreeDir,
     tryShowBoundSessionForRoot,
+    bootstrapState.phase,
   ]);
+
+  useEffect(() => {
+    return bootstrapService.subscribe((state) => {
+      setBootstrapState(state);
+      setRelayStatus(state.relayStatus);
+      setE2eeState(state.e2ee);
+    });
+  }, []);
 
   useEffect(() => {
     return e2eeService.subscribe((state) => {
@@ -5640,10 +5679,10 @@ export function App({ onGoHome }: AppProps) {
   }, []);
 
   useEffect(() => {
-    const nodeId = String(relayStatus?.e2ee_node_id || relayStatus?.node_id || "").trim();
-    const required = relayStatus?.e2ee_required === true;
-    e2eeService.configure(required, nodeId);
-  }, [relayStatus?.e2ee_required, relayStatus?.e2ee_node_id, relayStatus?.node_id]);
+    void syncNativeReplyPollerE2EE().catch((err) => {
+      console.warn("[ReplyPoller] Failed to sync E2EE state:", err);
+    });
+  }, [e2eeState.nodeId, e2eeState.required, e2eeState.unlocked]);
 
   useEffect(() => {
     if (!e2eeState.required) {
@@ -5651,6 +5690,13 @@ export function App({ onGoHome }: AppProps) {
       setE2eePromptError("");
     }
   }, [e2eeState.required, e2eeState.secretPresent]);
+
+  useEffect(() => {
+    if (bootstrapState.phase !== "ready") {
+      return;
+    }
+    setAgentsVersion((v) => v + 1);
+  }, [bootstrapState.phase]);
 
   const describeE2EEPromptError = useCallback((err: unknown) => {
     const code = err instanceof Error ? String(err.message || "").trim() : "";
@@ -5681,15 +5727,10 @@ export function App({ onGoHome }: AppProps) {
     setE2eePromptBusy(true);
     setE2eePromptError("");
     try {
-      e2eeService.setSecret(trimmed);
-      await e2eeService.ensureSession();
+      await bootstrapService.submitPairingSecret(trimmed);
+      didInitRef.current = false;
       setE2eeSecretInput("");
     } catch (err) {
-      if (err instanceof Error && err.message === "e2ee_proof_invalid") {
-        e2eeService.clearSecret();
-      } else {
-        e2eeService.clearSession();
-      }
       setE2eePromptError(describeE2EEPromptError(err));
     } finally {
       setE2eePromptBusy(false);
@@ -5794,8 +5835,16 @@ export function App({ onGoHome }: AppProps) {
           rootSessionKey(currentRootId, activeBoundSessionKey)
         ] as any)
       : null;
+  const isDetachedMainSessionTarget =
+    !!activeBoundSessionKey &&
+    selectedInCurrentRoot &&
+    !!selectedKey &&
+    selectedKey !== activeBoundSessionKey &&
+    interactionMode !== "drawer";
   const actionBarSession = activeBoundSessionKey
-    ? (currentSession as any) || boundFromCache || boundFromSelected
+    ? isDetachedMainSessionTarget
+      ? (selectedSession as any)
+      : (currentSession as any) || boundFromCache || boundFromSelected
     : selectedInCurrentRoot
       ? (selectedSession as any)
       : null;
@@ -5805,11 +5854,7 @@ export function App({ onGoHome }: AppProps) {
     interactionMode !== "drawer";
   const canOpenSessionDrawer = !!activeBoundSessionKey && !isBoundSessionInMain;
   const detachedBoundSession =
-    !!activeBoundSessionKey &&
-    selectedInCurrentRoot &&
-    !!selectedKey &&
-    selectedKey !== activeBoundSessionKey &&
-    !isDrawerOpen;
+    isDetachedMainSessionTarget && !isDrawerOpen;
 
   const matchedPlugin = useMemo(() => {
     if (!currentRootId || !file) return null;
@@ -6929,20 +6974,27 @@ export function App({ onGoHome }: AppProps) {
                 selectedKey === activeBoundSessionKey &&
                 interactionMode !== "drawer";
               if (isBoundSessionInMain) return;
+              const isDrawerCurrentlyOpen =
+                !!drawerOpenByRootRef.current[rootID || ""];
+              if (isDrawerCurrentlyOpen) {
+                interactionModeRef.current = "main";
+                setInteractionMode("main");
+                setDrawerOpenForRoot(rootID, false);
+                return;
+              }
               setInteractionMode("drawer");
-              setDrawerOpenForRoot(
-                rootID,
-                !(drawerOpenByRootRef.current[rootID || ""] || false),
-              );
+              setDrawerOpenForRoot(rootID, true);
             }}
           />
         }
         drawer={
           <BottomSheet
             isOpen={isDrawerOpen}
-            onClose={() =>
-              setDrawerOpenForRoot(currentRootIdRef.current, false)
-            }
+            onClose={() => {
+              interactionModeRef.current = "main";
+              setInteractionMode("main");
+              setDrawerOpenForRoot(currentRootIdRef.current, false);
+            }}
             onExpand={() => {
               handleSelectSession(currentSession);
               setDrawerOpenForRoot(currentRootIdRef.current, false);
@@ -6986,7 +7038,7 @@ export function App({ onGoHome }: AppProps) {
           </BottomSheet>
         }
       />
-      {e2eeState.required && !e2eeState.secretPresent ? (
+      {e2eeState.required && !e2eeState.unlocked ? (
         <div
           style={{
             position: "fixed",
